@@ -1,0 +1,581 @@
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::io;
+use syn::{
+    visit::{self, Visit}, ItemFn, Visibility, ExprUnsafe, ImplItemFn, UseTree, 
+};
+use quote::ToTokens;
+
+// 表示函数的基本信息
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FunctionInfo {
+    name: String,
+    module_path: String,
+    visibility: VisibilityKind,
+    has_internal_unsafe: bool,
+}
+
+// 表示函数的可见性
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum VisibilityKind {
+    Public,       // pub fn
+    Crate,        // pub(crate) fn
+    Module,       // fn (私有)
+    Restricted,   // pub(in path) fn 或 pub(super) fn
+}
+
+// 函数调用关系
+#[derive(Debug)]
+struct FunctionCall {
+    caller: String,    // 调用者的完整路径
+    callee: String,    // 被调用者的完整路径
+}
+
+// 函数调用图
+struct CallGraph {
+    // 从函数完整路径到函数信息的映射
+    functions: HashMap<String, FunctionInfo>,
+    // 从调用者到被调用者的映射
+    calls: HashMap<String, HashSet<String>>,
+    // 从被调用者到调用者的映射（反向图）
+    reverse_calls: HashMap<String, HashSet<String>>,
+    // 包含内部不安全代码的函数
+    unsafe_functions: HashSet<String>,
+    // 公开函数
+    public_functions: HashSet<String>,
+    // 公开且不安全的函数
+    public_unsafe_functions: HashSet<String>,
+}
+
+impl CallGraph {
+    fn new() -> Self {
+        CallGraph {
+            functions: HashMap::new(),
+            calls: HashMap::new(),
+            reverse_calls: HashMap::new(),
+            unsafe_functions: HashSet::new(),
+            public_functions: HashSet::new(),
+            public_unsafe_functions: HashSet::new(),
+        }
+    }
+
+    // 添加函数到图中
+    fn add_function(&mut self, path: String, info: FunctionInfo) {
+        if info.visibility == VisibilityKind::Public {
+            self.public_functions.insert(path.clone());
+            
+            // 如果函数既是公开的又包含不安全代码，添加到新集合中
+            if info.has_internal_unsafe {
+                self.public_unsafe_functions.insert(path.clone());
+            }
+        }
+        
+        if info.has_internal_unsafe {
+            self.unsafe_functions.insert(path.clone());
+        }
+        
+        self.functions.insert(path, info);
+    }
+
+    // 添加函数调用关系
+    fn add_call(&mut self, caller: String, callee: String) {
+        self.calls.entry(caller.clone()).or_insert_with(HashSet::new).insert(callee.clone());
+        self.reverse_calls.entry(callee).or_insert_with(HashSet::new).insert(caller);
+    }
+
+    // 查找从公开函数到内部不安全函数的所有有效路径
+    fn find_paths_to_unsafe(&self) -> Vec<Vec<String>> {
+        let mut all_paths = Vec::new();
+        
+        // 首先添加所有直接公开的不安全函数
+        for pub_unsafe_fn in &self.public_unsafe_functions {
+            let mut path = Vec::new();
+            path.push(pub_unsafe_fn.clone());
+            all_paths.push(path);
+        }
+        
+        // 获取非公开的不安全函数
+        let non_public_unsafe = self.unsafe_functions.difference(&self.public_unsafe_functions)
+                                                   .cloned()
+                                                   .collect::<HashSet<String>>();
+        
+        // 对每个公开函数，查找到非公开不安全函数的路径
+        for pub_fn in &self.public_functions {
+            // 排除已经是公开不安全的函数
+            if !self.public_unsafe_functions.contains(pub_fn) {
+                let paths = self.find_valid_paths(pub_fn, &non_public_unsafe);
+                all_paths.extend(paths);
+            }
+        }
+        
+        all_paths
+    }
+
+    // 查找从起始函数到目标函数集合中任意一个函数的所有有效路径
+    // 有效路径指的是中间节点不包含unsafe函数或公开的不安全函数
+    fn find_valid_paths(&self, start: &String, targets: &HashSet<String>) -> Vec<Vec<String>> {
+        let mut all_paths = Vec::new();
+        let mut visited = HashSet::new();
+        let mut path = Vec::new();
+        
+        self.dfs_find_valid_paths(start, targets, &mut visited, &mut path, &mut all_paths);
+        
+        all_paths
+    }
+
+    // 深度优先搜索查找有效路径
+    fn dfs_find_valid_paths(
+        &self,
+        current: &String,
+        targets: &HashSet<String>,
+        visited: &mut HashSet<String>,
+        path: &mut Vec<String>,
+        all_paths: &mut Vec<Vec<String>>,
+    ) {
+        if visited.contains(current) {
+            return; // 避免循环
+        }
+        
+        // 检查当前节点是否是中间节点，如果是则检查是否为unsafe函数或公开的不安全函数
+        if !path.is_empty() && !targets.contains(current) {
+            // 跳过中间节点为unsafe函数或公开的不安全函数的路径
+            if self.unsafe_functions.contains(current) || self.public_unsafe_functions.contains(current) {
+                return;
+            }
+        }
+        
+        visited.insert(current.clone());
+        path.push(current.clone());
+        
+        if targets.contains(current) {
+            all_paths.push(path.clone()); // 找到一条有效路径
+        } else if let Some(callees) = self.calls.get(current) {
+            for callee in callees {
+                self.dfs_find_valid_paths(callee, targets, visited, path, all_paths);
+            }
+        }
+        
+        // 回溯
+        path.pop();
+        visited.remove(current);
+    }
+}
+
+// 用于收集函数信息和检测unsafe块的访问者
+struct FunctionVisitor {
+    current_module_path: Vec<String>,
+    functions: HashMap<String, FunctionInfo>,
+    unsafe_functions: HashSet<String>,
+    current_function: Option<String>,
+    has_unsafe: bool,
+}
+
+impl FunctionVisitor {
+    fn new() -> Self {
+        FunctionVisitor {
+            current_module_path: Vec::new(),
+            functions: HashMap::new(),
+            unsafe_functions: HashSet::new(),
+            current_function: None,
+            has_unsafe: false,
+        }
+    }
+    
+    // 获取当前模块路径
+    fn get_current_module_path(&self) -> String {
+        self.current_module_path.join("::")
+    }
+    
+    // 从syn::Visibility转换为VisibilityKind
+    fn convert_visibility(&self, vis: &Visibility) -> VisibilityKind {
+        match vis {
+            Visibility::Public(_) => VisibilityKind::Public,
+            Visibility::Restricted(restricted) if restricted.path.is_ident("crate") => VisibilityKind::Crate,
+            Visibility::Restricted(_) => VisibilityKind::Restricted,
+            _ => VisibilityKind::Module,
+        }
+    }
+    
+    // 将函数添加到结果集
+    fn add_function(&mut self, name: String, vis: &Visibility) {
+        let module_path = self.get_current_module_path();
+        let full_path = if module_path.is_empty() {
+            name.clone()
+        } else {
+            format!("{}::{}", module_path, name)
+        };
+        
+        self.current_function = Some(full_path.clone());
+        self.has_unsafe = false;
+        
+        let info = FunctionInfo {
+            name,
+            module_path,
+            visibility: self.convert_visibility(vis),
+            has_internal_unsafe: false, // 稍后更新
+        };
+        
+        self.functions.insert(full_path, info);
+    }
+    
+    // 更新当前函数的unsafe状态
+    fn update_unsafe_state(&mut self) {
+        if let Some(ref func_path) = self.current_function {
+            if self.has_unsafe {
+                if let Some(info) = self.functions.get_mut(func_path) {
+                    info.has_internal_unsafe = true;
+                    self.unsafe_functions.insert(func_path.clone());
+                }
+            }
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for FunctionVisitor {
+    // 访问模块
+    fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
+        self.current_module_path.push(i.ident.to_string());
+        
+        // 访问模块内容
+        if let Some((_, items)) = &i.content {
+            for item in items {
+                visit::visit_item(self, item);
+            }
+        }
+        
+        self.current_module_path.pop();
+    }
+    
+    // 访问函数定义
+    fn visit_item_fn(&mut self, i: &'ast ItemFn) {
+        let name = i.sig.ident.to_string();
+        self.add_function(name, &i.vis);
+        
+        // 访问函数体
+        visit::visit_block(self, &i.block);
+        
+        // 更新unsafe状态
+        self.update_unsafe_state();
+        self.current_function = None;
+    }
+    
+    // 访问impl块中的函数
+    fn visit_impl_item_fn(&mut self, i: &'ast ImplItemFn) {
+        let name = i.sig.ident.to_string();
+        self.add_function(name, &i.vis);
+        
+        // 访问函数体
+        visit::visit_block(self, &i.block);
+        
+        // 更新unsafe状态
+        self.update_unsafe_state();
+        self.current_function = None;
+    }
+    
+    // 访问unsafe块
+    fn visit_expr_unsafe(&mut self, i: &'ast ExprUnsafe) {
+        self.has_unsafe = true;
+        
+        // 继续访问unsafe块内部
+        visit::visit_expr_unsafe(self, i);
+    }
+}
+
+// 用于收集函数调用关系的访问者
+struct CallVisitor {
+    current_module_path: Vec<String>,
+    current_function: Option<String>,
+    calls: Vec<FunctionCall>,
+    // 导入的模块和别名映射
+    imports: HashMap<String, String>,
+}
+
+impl CallVisitor {
+    fn new() -> Self {
+        CallVisitor {
+            current_module_path: Vec::new(),
+            current_function: None,
+            calls: Vec::new(),
+            imports: HashMap::new(),
+        }
+    }
+    
+    // 获取当前模块路径
+    fn get_current_module_path(&self) -> String {
+        self.current_module_path.join("::")
+    }
+    
+    // 处理函数调用表达式
+    fn handle_call(&mut self, func_path: &syn::Path) {
+        if let Some(ref caller) = self.current_function {
+            let callee = self.resolve_path(func_path);
+            self.calls.push(FunctionCall {
+                caller: caller.clone(),
+                callee,
+            });
+        }
+    }
+    
+    // 解析路径，处理导入和别名
+    fn resolve_path(&self, path: &syn::Path) -> String {
+        let path_str = path.to_token_stream().to_string().replace(' ', "");
+        
+        // 检查是否是导入的模块或别名
+        if path.segments.len() > 0 {
+            let first_segment = &path.segments[0].ident.to_string();
+            if let Some(import) = self.imports.get(first_segment) {
+                // 替换路径的第一部分为导入的完整路径
+                return path_str.replacen(first_segment, import, 1);
+            }
+        }
+        
+        // 如果是相对路径（不以crate::或::开头），加上当前模块路径
+        if !path_str.starts_with("crate::") && !path_str.starts_with("::") {
+            let module_path = self.get_current_module_path();
+            if !module_path.is_empty() {
+                return format!("{}::{}", module_path, path_str);
+            }
+        }
+        
+        path_str
+    }
+    
+    // 处理导入语句
+    fn process_use(&mut self, use_tree: &UseTree, prefix: &str) {
+        match use_tree {
+            UseTree::Path(use_path) => {
+                let next_prefix = if prefix.is_empty() {
+                    use_path.ident.to_string()
+                } else {
+                    format!("{}::{}", prefix, use_path.ident)
+                };
+                self.process_use(&*use_path.tree, &next_prefix);
+            },
+            UseTree::Name(use_name) => {
+                let full_path = if prefix.is_empty() {
+                    use_name.ident.to_string()
+                } else {
+                    format!("{}::{}", prefix, use_name.ident)
+                };
+                // 添加到导入映射
+                self.imports.insert(use_name.ident.to_string(), full_path);
+            },
+            UseTree::Rename(use_rename) => {
+                let full_path = if prefix.is_empty() {
+                    use_rename.ident.to_string()
+                } else {
+                    format!("{}::{}", prefix, use_rename.ident)
+                };
+                // 添加别名到导入映射
+                self.imports.insert(use_rename.rename.to_string(), full_path);
+            },
+            UseTree::Glob(_) => {
+                // 处理通配符导入较复杂，这里简化处理
+            },
+            UseTree::Group(use_group) => {
+                for tree in &use_group.items {
+                    self.process_use(tree, prefix);
+                }
+            },
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for CallVisitor {
+    // 访问模块
+    fn visit_item_mod(&mut self, i: &'ast syn::ItemMod) {
+        self.current_module_path.push(i.ident.to_string());
+        
+        // 访问模块内容
+        if let Some((_, items)) = &i.content {
+            for item in items {
+                visit::visit_item(self, item);
+            }
+        }
+        
+        self.current_module_path.pop();
+    }
+    
+    // 访问函数定义
+    fn visit_item_fn(&mut self, i: &'ast ItemFn) {
+        let name = i.sig.ident.to_string();
+        let module_path = self.get_current_module_path();
+        let full_path = if module_path.is_empty() {
+            name
+        } else {
+            format!("{}::{}", module_path, name)
+        };
+        
+        self.current_function = Some(full_path);
+        
+        // 访问函数体
+        visit::visit_block(self, &i.block);
+        
+        self.current_function = None;
+    }
+    
+    // 访问impl块中的函数
+    fn visit_impl_item_fn(&mut self, i: &'ast ImplItemFn) {
+        let name = i.sig.ident.to_string();
+        let module_path = self.get_current_module_path();
+        let full_path = if module_path.is_empty() {
+            name
+        } else {
+            format!("{}::{}", module_path, name)
+        };
+        
+        self.current_function = Some(full_path);
+        
+        // 访问函数体
+        visit::visit_block(self, &i.block);
+        
+        self.current_function = None;
+    }
+    
+    // 访问函数调用表达式
+    fn visit_expr_call(&mut self, i: &'ast syn::ExprCall) {
+        // 检查被调用的表达式是否是路径（函数名）
+        if let syn::Expr::Path(expr_path) = &*i.func {
+            self.handle_call(&expr_path.path);
+        }
+        
+        // 继续访问参数
+        for arg in &i.args {
+            visit::visit_expr(self, arg);
+        }
+    }
+    
+    // 访问方法调用表达式
+    fn visit_expr_method_call(&mut self, i: &'ast syn::ExprMethodCall) {
+        // 方法调用更复杂，需要类型信息才能准确解析
+        // 这里简化处理，只记录方法名
+        if let Some(ref caller) = self.current_function {
+            let method_name = i.method.to_string();
+            // 简化：假设方法是在当前模块中定义的
+            let module_path = self.get_current_module_path();
+            let callee = if module_path.is_empty() {
+                method_name
+            } else {
+                format!("{}::{}", module_path, method_name)
+            };
+            
+            self.calls.push(FunctionCall {
+                caller: caller.clone(),
+                callee,
+            });
+        }
+        
+        // 继续访问接收者和参数
+        visit::visit_expr(self, &i.receiver);
+        for arg in &i.args {
+            visit::visit_expr(self, arg);
+        }
+    }
+    
+    // 访问导入语句
+    fn visit_item_use(&mut self, i: &'ast syn::ItemUse) {
+        self.process_use(&i.tree, "");
+        visit::visit_item_use(self, i);
+    }
+}
+
+// 静态分析器
+struct StaticAnalyzer {
+    call_graph: CallGraph,
+}
+
+impl StaticAnalyzer {
+    fn new() -> Self {
+        StaticAnalyzer {
+            call_graph: CallGraph::new(),
+        }
+    }
+    
+    // 分析Rust源代码文件
+    fn analyze_file(&mut self, file_path: &Path) -> io::Result<()> {
+        let source = fs::read_to_string(file_path)?;
+        
+        // 解析源代码
+        let syntax = syn::parse_file(&source).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("Parse error: {}", e))
+        })?;
+        
+        // 收集函数信息
+        let mut fn_visitor = FunctionVisitor::new();
+        fn_visitor.visit_file(&syntax);
+        
+        // 收集函数调用关系
+        let mut call_visitor = CallVisitor::new();
+        call_visitor.visit_file(&syntax);
+        
+        // 将结果添加到调用图
+        for (path, info) in fn_visitor.functions {
+            self.call_graph.add_function(path, info);
+        }
+        
+        for call in call_visitor.calls {
+            self.call_graph.add_call(call.caller, call.callee);
+        }
+        
+        Ok(())
+    }
+    
+    // 递归分析目录
+    fn analyze_directory(&mut self, dir_path: &Path) -> io::Result<()> {
+        if dir_path.is_dir() {
+            for entry in fs::read_dir(dir_path)? {
+                let entry = entry?;
+                let path = entry.path();
+                
+                if path.is_dir() {
+                    self.analyze_directory(&path)?;
+                } else if let Some(extension) = path.extension() {
+                    if extension == "rs" {
+                        self.analyze_file(&path)?;
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    // 查找并打印从公开函数到内部不安全函数的所有有效路径
+    fn find_unsafe_call_paths(&self) -> Vec<String> {
+        let paths = self.call_graph.find_paths_to_unsafe();
+        paths.iter()
+            .map(|path| path.join(" -> "))
+            .collect()
+    }
+}
+
+fn main() -> io::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        eprintln!("Usage: {} <path-to-rust-project>", args[0]);
+        return Ok(());
+    }
+
+    let project_path = PathBuf::from(&args[1]);
+    let mut analyzer = StaticAnalyzer::new();
+    
+    // 如果是目录，递归分析
+    if project_path.is_dir() {
+        analyzer.analyze_directory(&project_path)?;
+    } else if project_path.is_file() && project_path.extension().map_or(false, |ext| ext == "rs") {
+        analyzer.analyze_file(&project_path)?;
+    } else {
+        eprintln!("The path must be a Rust file (.rs) or a directory containing Rust files.");
+        return Ok(());
+    }
+    
+    let results = analyzer.find_unsafe_call_paths();
+    
+    println!("Found {} valid paths from public functions to internal unsafe functions:", results.len());
+    for (i, path) in results.iter().enumerate() {
+        println!("{}. {}", i + 1, path);
+    }
+    
+    Ok(())
+}
