@@ -494,7 +494,7 @@ impl StaticAnalyzer {
                     }
                 }
                 
-                // 输出类型定义和实例方法
+                // 第一步：输出所有类型定义
                 if !all_types.is_empty() {
                     writeln!(writer, "\n        // 相关自定义类型定义:")?;
                     
@@ -539,26 +539,24 @@ impl StaticAnalyzer {
                             // 输出处理后的类型定义
                             let type_text = processed_type.join("\n");
                             writeln!(writer, "{}", type_text)?;
+                            writeln!(writer, "")?;
                             
-                            // 现在找到所有属于这个类型的方法（包含&self参数）
+                            // 直接在类型定义后输出其impl块和实例方法
                             let type_name = type_path.split("::").last().unwrap_or(type_path);
-                            let mut impl_methods = Vec::new();
                             
-                            // 从所有方法中筛选出属于当前类型的方法
-                            for method in &all_methods {
-                                // 检查方法是否有self参数
-                                if method.has_self_param {
-                                    // 将方法添加到impl块中
-                                    impl_methods.push(method);
-                                    processed_method_paths.insert(method.full_path.clone());
-                                }
-                            }
+                            // 查找属于这个类型的实例方法
+                            let instance_methods: Vec<_> = all_methods.iter()
+                                .filter(|method| {
+                                    method.has_self_param && 
+                                    method.owner_type.as_ref().map_or(false, |t| t == type_name)
+                                })
+                                .collect();
                             
-                            // 如果找到了方法或者有构造函数，创建impl块
-                            if !impl_methods.is_empty() || !type_def.constructors.is_empty() {
-                                writeln!(writer, "\n        impl {} {{", type_name)?;
+                            // 如果有构造函数或实例方法，则创建impl块
+                            if !type_def.constructors.is_empty() || !instance_methods.is_empty() {
+                                writeln!(writer, "        impl {} {{", type_name)?;
                                 
-                                // 首先输出构造函数
+                                // 先输出构造函数
                                 for constructor in &type_def.constructors {
                                     if !constructor.contains("Call chain") {
                                         let formatted_constructor = extract_method_from_impl(&utils::beautify_source_code(constructor))
@@ -572,8 +570,8 @@ impl StaticAnalyzer {
                                 }
                                 
                                 // 然后输出实例方法
-                                for method in &impl_methods {
-                                    // 添加方法的注释：入口点、中间函数或不安全实现
+                                for method in &instance_methods {
+                                    // 添加方法的注释
                                     let method_type = if unsafe_functions.iter().any(|n| n.full_path == method.full_path) {
                                         "不安全实现"
                                     } else if seen_entry_points.contains(&method.full_path) {
@@ -584,7 +582,7 @@ impl StaticAnalyzer {
                                     
                                     writeln!(writer, "\n            // {}: {}", method_type, method.full_path)?;
                                     
-                                    // 提取方法代码并添加正确的缩进，同时过滤掉文档注释
+                                    // 输出方法代码
                                     let method_code = extract_method_from_impl(&utils::beautify_source_code(&method.source_code))
                                         .lines()
                                         .map(|line| format!("            {}", line))
@@ -592,32 +590,27 @@ impl StaticAnalyzer {
                                         .join("\n");
                                     
                                     writeln!(writer, "{}", method_code)?;
+                                    
+                                    // 标记该方法已处理
+                                    processed_method_paths.insert(method.full_path.clone());
                                 }
                                 
                                 writeln!(writer, "        }}\n")?;
-                            } else {
-                                writeln!(writer, "")?;
                             }
                         }
                     }
                 }
                 
-                // 创建一个新的Vec来存储没有被处理的方法
+                // 第四步：输出其余的函数（没有处理过的函数和非实例方法）
                 let remaining_methods: Vec<_> = all_methods.iter()
-                    .filter(|method| {
-                        // 如果方法已经被处理过，则跳过
-                        !processed_method_paths.contains(&method.full_path) &&
-                        // 如果方法是实例方法，也跳过，因为它们应该放在impl块中
-                        !method.has_self_param
-                    })
+                    .filter(|method| !processed_method_paths.contains(&method.full_path))
                     .collect();
                 
-                // 输出剩余的静态函数（没有放入impl块的函数）
                 if !remaining_methods.is_empty() {
                     writeln!(writer, "        // 其他函数实现:")?;
                     
-                    for method in &remaining_methods {
-                        // 添加方法的注释：入口点、中间函数或不安全实现
+                    for method in remaining_methods {
+                        // 添加方法的注释
                         let method_type = if unsafe_functions.iter().any(|n| n.full_path == method.full_path) {
                             "不安全实现"
                         } else if seen_entry_points.contains(&method.full_path) {
@@ -628,7 +621,7 @@ impl StaticAnalyzer {
                         
                         writeln!(writer, "        // {}: {}", method_type, method.full_path)?;
                         
-                        // 输出方法代码，同时过滤掉文档注释
+                        // 输出方法代码
                         let source_code = filter_doc_comments(&utils::beautify_source_code(&method.source_code))
                             .lines()
                             .map(|line| format!("        {}", line))
@@ -637,53 +630,6 @@ impl StaticAnalyzer {
                         
                         writeln!(writer, "{}", source_code)?;
                         writeln!(writer, "")?;
-                    }
-                }
-                
-                // 添加所有带有&self参数的方法到Queue的impl块中
-                // 找到所有带有&self参数的方法
-                let self_methods: Vec<_> = all_methods.iter()
-                    .filter(|method| method.has_self_param)
-                    .collect();
-                
-                if !self_methods.is_empty() {
-                    // 找到Queue类型
-                    let queue_type = all_types.iter()
-                        .find(|type_path| type_path.ends_with("Queue"));
-                    
-                    if let Some(queue_type) = queue_type {
-                        let type_name = queue_type.split("::").last().unwrap_or(queue_type);
-                        
-                        // 创建或扩展impl块
-                        writeln!(writer, "\n        impl {} {{", type_name)?;
-                        
-                        // 输出所有实例方法
-                        for method in &self_methods {
-                            // 添加方法的注释：入口点、中间函数或不安全实现
-                            let method_type = if unsafe_functions.iter().any(|n| n.full_path == method.full_path) {
-                                "不安全实现"
-                            } else if seen_entry_points.contains(&method.full_path) {
-                                "公共入口点"
-                            } else {
-                                "中间函数"
-                            };
-                            
-                            writeln!(writer, "\n            // {}: {}", method_type, method.full_path)?;
-                            
-                            // 提取方法代码并添加正确的缩进，同时过滤掉文档注释
-                            let method_code = extract_method_from_impl(&utils::beautify_source_code(&method.source_code))
-                                .lines()
-                                .map(|line| format!("            {}", line))
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            
-                            writeln!(writer, "{}", method_code)?;
-                            
-                            // 标记方法已处理
-                            processed_method_paths.insert(method.full_path.clone());
-                        }
-                        
-                        writeln!(writer, "        }}\n")?;
                     }
                 }
                 

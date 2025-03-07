@@ -74,6 +74,32 @@ impl FunctionVisitor {
         // Analyze custom types used in function parameters and return
         let (param_types, return_types) = self.analyze_function_signature(&fn_item.sig);
         
+        // 检测是否包含&self参数
+        let has_self_param = fn_item.sig.inputs.iter().any(|arg| {
+            match arg {
+                syn::FnArg::Receiver(_) => true,
+                syn::FnArg::Typed(pat_type) => {
+                    if let syn::Pat::Ident(pat_ident) = &*pat_type.pat {
+                        return pat_ident.ident == "self";
+                    }
+                    false
+                }
+            }
+        });
+        
+        // 确定函数所属的类型
+        let owner_type = if has_self_param {
+            // 尝试从module_path中推断类型
+            let parts: Vec<&str> = module_path.split("::").collect();
+            if !parts.is_empty() {
+                Some(parts.last().unwrap().to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        
         let info = FunctionInfo {
             name,
             module_path,
@@ -84,6 +110,8 @@ impl FunctionVisitor {
             source_code,
             param_custom_types: param_types,
             return_custom_types: return_types,
+            has_self_param,
+            owner_type,
         };
         
         self.functions.insert(full_path, info);
@@ -111,11 +139,26 @@ impl FunctionVisitor {
         let (mut param_types, return_types) = self.analyze_function_signature(&impl_fn.sig);
         
         // If method has self parameter and we know current impl type, add it to parameter types
-        if impl_fn.sig.inputs.iter().any(|arg| matches!(arg, syn::FnArg::Receiver(_))) {
+        let has_self_param = impl_fn.sig.inputs.iter().any(|arg| matches!(arg, syn::FnArg::Receiver(_)));
+        
+        // 确定函数所属的类型
+        let owner_type = if has_self_param {
             if let Some(impl_type) = &self.current_impl_type {
+                // 如果在impl块中，我们知道类型
                 param_types.insert(impl_type.clone());
+                Some(impl_type.clone())
+            } else {
+                // 尝试从module_path中推断类型
+                let parts: Vec<&str> = module_path.split("::").collect();
+                if !parts.is_empty() {
+                    Some(parts.last().unwrap().to_string())
+                } else {
+                    None
+                }
             }
-        }
+        } else {
+            None
+        };
         
         let info = FunctionInfo {
             name,
@@ -127,6 +170,8 @@ impl FunctionVisitor {
             source_code,
             param_custom_types: param_types,
             return_custom_types: return_types,
+            has_self_param,
+            owner_type,
         };
         
         self.functions.insert(full_path, info);

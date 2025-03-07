@@ -131,10 +131,8 @@ impl CallGraph {
                         .cloned()
                         .unwrap_or_else(HashSet::new);
                     
-                    // 检测函数是否包含&self参数
-                    let has_self_param = info.source_code.contains("&self") 
-                        || info.source_code.contains("&mut self") 
-                        || info.source_code.contains("self: &");
+                    //println!("Function: {}, has_self_param: {}, owner_type: {:?}", 
+                        //full_path, info.has_self_param, info.owner_type);
                     
                     PathNodeInfo {
                         full_path,
@@ -142,7 +140,8 @@ impl CallGraph {
                         source_code: info.source_code.clone(),
                         param_custom_types: param_types,
                         return_custom_types: return_types,
-                        has_self_param,
+                        has_self_param: info.has_self_param,
+                        owner_type: info.owner_type.clone(),
                     }
                 } else {
                     // Default value, normally shouldn't reach here
@@ -153,6 +152,7 @@ impl CallGraph {
                         param_custom_types: HashSet::new(),
                         return_custom_types: HashSet::new(),
                         has_self_param: false,
+                        owner_type: None,
                     }
                 }
             })
