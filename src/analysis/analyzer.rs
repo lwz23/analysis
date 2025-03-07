@@ -356,6 +356,17 @@ impl StaticAnalyzer {
         let file = File::create(output_path)?;
         let mut writer = BufWriter::new(file);
         
+        // 添加文件头部注释和模块声明
+        writeln!(writer, "// 自动生成的Rust代码文件 - 包含不安全函数调用路径分析结果")?;
+        writeln!(writer, "// 此文件可以被编译器解析，具有语法高亮")?;
+        writeln!(writer, "\n// 注意：此文件仅用于查看，不应直接编译或运行")?;
+        writeln!(writer, "// 生成时间: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))?;
+        writeln!(writer, "\n#![allow(dead_code)]")?;
+        writeln!(writer, "#![allow(unused_variables)]")?;
+        writeln!(writer, "#![allow(unused_imports)]")?;
+        writeln!(writer, "#![allow(non_snake_case)]")?;
+        writeln!(writer, "\n// 分析结果开始\n")?;
+        
         let results = self.get_results();
         
         for result in &results {
@@ -363,8 +374,20 @@ impl StaticAnalyzer {
                 continue;
             }
             
-            // File title
-            writeln!(writer, "File: {}", result.file_path)?;
+            // 文件标题作为模块注释
+            writeln!(writer, "// ============================================================")?;
+            writeln!(writer, "// 文件: {}", result.file_path)?;
+            writeln!(writer, "// ============================================================\n")?;
+            
+            // 为每个文件创建一个模块
+            let module_name = Path::new(&result.file_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown_module")
+                .replace("-", "_")
+                .replace(".", "_");
+            
+            writeln!(writer, "pub mod {} {{", module_name)?;
             
             // Group paths by their destination function (the unsafe function)
             let mut paths_by_destination: HashMap<String, Vec<Vec<PathNodeInfo>>> = HashMap::new();
@@ -382,17 +405,21 @@ impl StaticAnalyzer {
                     .push(path.clone());
             }
             
-            writeln!(writer, "Found {} groups of paths to unsafe functions:", paths_by_destination.len())?;
+            writeln!(writer, "    // 发现 {} 组通向不安全函数的路径", paths_by_destination.len())?;
             
             // Process each group of paths leading to the same unsafe function
             for (group_idx, (unsafe_fn, paths)) in paths_by_destination.into_iter().enumerate() {
-                // Group header with the unsafe function name
+                // 为每个组创建一个子模块
                 let unsafe_fn_name = unsafe_fn.split("::").last().unwrap_or(&unsafe_fn);
-                writeln!(writer, "\nGroup {}: Paths to unsafe function: {}", group_idx + 1, unsafe_fn_name)?;
+                let group_module_name = format!("group_{}", group_idx + 1);
                 
-                // List all paths in this group (just the function names, not implementations)
+                writeln!(writer, "\n    // 组 {}: 通向不安全函数的路径: {}", group_idx + 1, unsafe_fn_name)?;
+                writeln!(writer, "    pub mod {} {{", group_module_name)?;
+                
+                // 添加路径信息作为注释
+                writeln!(writer, "        // 路径列表:")?;
                 for (path_idx, path) in paths.iter().enumerate() {
-                    writeln!(writer, "  {}.{} {}", 
+                    writeln!(writer, "        // {}.{} {}", 
                         group_idx + 1, 
                         path_idx + 1, 
                         Self::format_path_with_visibility(path))?;
@@ -431,25 +458,58 @@ impl StaticAnalyzer {
                 
                 // List all relevant type definitions
                 if !all_types.is_empty() {
-                    writeln!(writer, "\n// Related custom type definitions:")?;
+                    writeln!(writer, "\n        // 相关自定义类型定义:")?;
                     for type_path in &all_types {
                         if let Some(type_def) = result.type_definitions.get(type_path) {
-                            writeln!(writer, "// Type: {}", type_path)?;
+                            writeln!(writer, "        // 类型: {}", type_path)?;
                             
-                            // Output type definition
+                            // Output type definition with proper indentation
                             let formatted_type = utils::beautify_source_code(&type_def.source_code);
+                            
+                            // 处理可能的冗余pub关键字
                             let visibility_prefix = type_def.visibility.to_string();
-                            if !formatted_type.trim_start().starts_with("pub ") && !visibility_prefix.is_empty() {
-                                writeln!(writer, "{}{}", visibility_prefix, formatted_type)?;
-                            } else {
-                                writeln!(writer, "{}", formatted_type)?;
+                            
+                            // 将格式化后的代码分割成行
+                            let lines: Vec<&str> = formatted_type.lines().collect();
+                            let mut processed_lines = Vec::new();
+                            
+                            for line in lines {
+                                let trimmed = line.trim();
+                                
+                                // 检查是否是结构体或枚举的开始
+                                if trimmed.contains("struct ") || trimmed.contains("enum ") {
+                                    // 如果这行包含pub并且我们要添加pub前缀
+                                    if trimmed.starts_with("pub ") && !visibility_prefix.is_empty() {
+                                        // 移除原有的pub
+                                        let without_pub = trimmed.replacen("pub ", "", 1);
+                                        processed_lines.push(format!("        {}{}", visibility_prefix, without_pub));
+                                    } else if !trimmed.starts_with("pub ") && !visibility_prefix.is_empty() {
+                                        // 添加可见性前缀
+                                        processed_lines.push(format!("        {}{}", visibility_prefix, trimmed));
+                                    } else {
+                                        // 保持原样，只添加缩进
+                                        processed_lines.push(format!("        {}", trimmed));
+                                    }
+                                } else {
+                                    // 其他行（包括注释和结构体结束的大括号）保持原样，只添加缩进
+                                    processed_lines.push(format!("        {}", line.trim_matches(' ')));
+                                }
                             }
                             
-                            // Output constructors once
+                            // 将处理后的行合并成最终的字符串
+                            let final_output = processed_lines.join("\n");
+                            writeln!(writer, "{}", final_output)?;
+                            
+                            // Output constructors once with proper indentation
                             for constructor in &type_def.constructors {
                                 // Only output constructors, not path-specific methods
                                 if !constructor.contains("Call chain") {
-                                    let formatted_constructor = utils::beautify_source_code(constructor);
+                                    let formatted_constructor = utils::beautify_source_code(constructor)
+                                        .lines()
+                                        .map(|line| format!("        {}", line))
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    
                                     writeln!(writer, "\n{}", formatted_constructor)?;
                                 }
                             }
@@ -460,7 +520,7 @@ impl StaticAnalyzer {
                 }
                 
                 // Output implementations of all functions in this group
-                writeln!(writer, "// Function implementations:")?;
+                writeln!(writer, "        // 函数实现:")?;
                 
                 // 1. Output the public entry point functions first
                 let mut seen_entry_points = HashSet::new();
@@ -468,8 +528,13 @@ impl StaticAnalyzer {
                     if !path.is_empty() {
                         let entry_node = &path[0];
                         if seen_entry_points.insert(entry_node.full_path.clone()) {
-                            writeln!(writer, "// Public entry point: {}", entry_node.full_path)?;
-                            let source_code = utils::beautify_source_code(&entry_node.source_code);
+                            writeln!(writer, "        // 公共入口点: {}", entry_node.full_path)?;
+                            let source_code = utils::beautify_source_code(&entry_node.source_code)
+                                .lines()
+                                .map(|line| format!("        {}", line))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            
                             writeln!(writer, "{}", source_code)?;
                             writeln!(writer, "")?;
                         }
@@ -480,8 +545,13 @@ impl StaticAnalyzer {
                 for path in &paths {
                     if !path.is_empty() {
                         let unsafe_node = path.last().unwrap();
-                        writeln!(writer, "// Unsafe implementation: {}", unsafe_node.full_path)?;
-                        let source_code = utils::beautify_source_code(&unsafe_node.source_code);
+                        writeln!(writer, "        // 不安全实现: {}", unsafe_node.full_path)?;
+                        let source_code = utils::beautify_source_code(&unsafe_node.source_code)
+                            .lines()
+                            .map(|line| format!("        {}", line))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        
                         writeln!(writer, "{}", source_code)?;
                         writeln!(writer, "")?;
                         break; // Only need to output it once
@@ -501,21 +571,26 @@ impl StaticAnalyzer {
                 }
                 
                 for (_, node) in intermediate_functions {
-                    writeln!(writer, "// Intermediate function: {}", node.full_path)?;
-                    let source_code = utils::beautify_source_code(&node.source_code);
+                    writeln!(writer, "        // 中间函数: {}", node.full_path)?;
+                    let source_code = utils::beautify_source_code(&node.source_code)
+                        .lines()
+                        .map(|line| format!("        {}", line))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    
                     writeln!(writer, "{}", source_code)?;
                     writeln!(writer, "")?;
                 }
                 
-                // Group separator
-                writeln!(writer, "{}", "-".repeat(80))?;
+                // 关闭组模块
+                writeln!(writer, "    }} // end of module {}", group_module_name)?;
             }
             
-            // File separator
-            writeln!(writer, "\n{}", "=".repeat(80))?;
+            // 关闭文件模块
+            writeln!(writer, "}} // end of module {}\n", module_name)?;
         }
         
-        println!("Successfully wrote analysis results for {} files", results.len());
+        println!("成功写入 {} 个文件的分析结果", results.len());
         Ok(())
     }
     

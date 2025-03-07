@@ -13,7 +13,7 @@ fn main() -> std::io::Result<()> {
     if args.len() < 2 {
         eprintln!("Usage: {} <Rust project or file path> [output file]", args[0]);
         eprintln!("  <Rust project or file path>: Path to a Rust file or directory");
-        eprintln!("  [output file]: Optional path to save results (default: unsafe_paths.txt)");
+        eprintln!("  [output file]: Optional path to save results (default: unsafe_paths.rs)");
         return Ok(());
     }
 
@@ -21,7 +21,7 @@ fn main() -> std::io::Result<()> {
     let output_path = if args.len() >= 3 {
         PathBuf::from(&args[2])
     } else {
-        PathBuf::from("unsafe_paths.txt")
+        PathBuf::from("unsafe_paths.rs")
     };
     
     // Use catch_unwind to capture all possible panics
