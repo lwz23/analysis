@@ -2,7 +2,7 @@
 // 此文件可以被编译器解析，具有语法高亮
 
 // 注意：此文件仅用于查看，不应直接编译或运行
-// 生成时间: 2025-03-07 08:43:59
+// 生成时间: 2025-03-07 08:59:38
 
 #![allow(dead_code)]
 #![allow(unused_variables)]
@@ -25,9 +25,7 @@ pub mod test_unsafe_with_comments {
 
         // 相关自定义类型定义:
         // 类型: Queue
-        /// Queue结构体，用于测试带有注释的类型定义
         pub struct Queue<T> {
-        /// 内部数据
         data: Vec<T>,
         }
 
@@ -39,13 +37,11 @@ pub mod test_unsafe_with_comments {
 
         // 其他函数实现:
         // 公共入口点: send_back
-        /// 将元素添加到队列末尾
         pub fn send_back(&self, item: T, timeout: u32) -> Result<bool, &'static str> {
             self.send_generic(item, timeout, 0)
         }
 
         // 不安全实现: send_generic
-        /// 内部通用发送函数
         fn send_generic(&self, item: T, timeout: u32, flags: u8) -> Result<bool, &'static str> {
             unsafe { self.send_unsafe(item, timeout, flags) }
         }

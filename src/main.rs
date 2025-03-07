@@ -21,7 +21,14 @@ fn main() -> std::io::Result<()> {
     let output_path = if args.len() >= 3 {
         PathBuf::from(&args[2])
     } else {
-        PathBuf::from("unsafe_paths.rs")
+        let mut output = PathBuf::from(&args[1]);
+        if output.is_dir() {
+            output = output.join("unsafe_paths.rs");
+        } else {
+            let stem = output.file_stem().unwrap_or_default();
+            output = output.with_file_name(format!("{}_analysis.rs", stem.to_string_lossy()));
+        }
+        output
     };
     
     // Use catch_unwind to capture all possible panics

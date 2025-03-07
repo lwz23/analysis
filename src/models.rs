@@ -89,6 +89,7 @@ pub struct PathNodeInfo {
     pub source_code: String,     // Function source code
     pub param_custom_types: HashSet<String>, // Custom types used in function parameters
     pub return_custom_types: HashSet<String>, // Custom types used in function return
+    pub has_self_param: bool,    // 是否包含&self参数
 }
 
 // Analysis result for a single file

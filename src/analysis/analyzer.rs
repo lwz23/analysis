@@ -369,10 +369,16 @@ impl StaticAnalyzer {
         
         let results = self.get_results();
         
+        // 用于跟踪已处理的文件，避免重复输出
+        let mut processed_files = HashSet::new();
+        
         for result in &results {
-            if result.paths.is_empty() {
+            if result.paths.is_empty() || processed_files.contains(&result.file_path) {
                 continue;
             }
+            
+            // 标记文件已处理
+            processed_files.insert(result.file_path.clone());
             
             // 文件标题作为模块注释
             writeln!(writer, "// ============================================================")?;
@@ -425,9 +431,49 @@ impl StaticAnalyzer {
                         Self::format_path_with_visibility(path))?;
                 }
                 
-                // Collect all unique functions involved in any path of this group
-                let mut all_functions = HashSet::new();
-                let mut entry_functions = HashSet::new();
+                // 收集所有需要输出的函数
+                let mut all_methods = Vec::new();
+                let mut processed_method_paths = HashSet::new();
+                
+                // 收集入口点函数
+                let mut seen_entry_points = HashSet::new();
+                for path in &paths {
+                    if !path.is_empty() {
+                        let entry_node = &path[0];
+                        if seen_entry_points.insert(entry_node.full_path.clone()) {
+                            all_methods.push(entry_node);
+                        }
+                    }
+                }
+                
+                // 收集不安全函数
+                let mut unsafe_functions = Vec::new();
+                for path in &paths {
+                    if !path.is_empty() {
+                        let unsafe_node = path.last().unwrap();
+                        // 只添加一次
+                        if !unsafe_functions.iter().any(|n: &&PathNodeInfo| n.full_path == unsafe_node.full_path) {
+                            unsafe_functions.push(unsafe_node);
+                        }
+                    }
+                }
+                all_methods.extend(unsafe_functions.iter().cloned());
+                
+                // 收集中间函数
+                let mut intermediate_functions = HashMap::new();
+                for path in &paths {
+                    if path.len() > 2 { // Only paths with intermediates
+                        for i in 1..path.len()-1 {
+                            let node = &path[i];
+                            intermediate_functions.insert(node.full_path.clone(), node);
+                        }
+                    }
+                }
+                for (_, node) in &intermediate_functions {
+                    all_methods.push(node);
+                }
+                
+                // 收集所有相关的类型定义
                 let mut all_types = HashSet::new();
                 
                 for path in &paths {
@@ -435,15 +481,7 @@ impl StaticAnalyzer {
                         continue;
                     }
                     
-                    // Add all functions in this path
-                    for node in path {
-                        all_functions.insert(node.full_path.clone());
-                    }
-                    
-                    // Add the first function (entry point) to track types
-                    entry_functions.insert(path[0].full_path.clone());
-                    
-                    // Collect custom types from entry function parameters
+                    // 收集入口函数参数中的自定义类型
                     let param_types = &path[0].param_custom_types;
                     for type_name in param_types {
                         for (type_path, _) in &result.type_definitions {
@@ -456,97 +494,142 @@ impl StaticAnalyzer {
                     }
                 }
                 
-                // List all relevant type definitions
+                // 输出类型定义和实例方法
                 if !all_types.is_empty() {
                     writeln!(writer, "\n        // 相关自定义类型定义:")?;
+                    
+                    // 遍历每个类型
                     for type_path in &all_types {
                         if let Some(type_def) = result.type_definitions.get(type_path) {
                             writeln!(writer, "        // 类型: {}", type_path)?;
                             
-                            // Output type definition with proper indentation
-                            let formatted_type = utils::beautify_source_code(&type_def.source_code);
+                            // 输出类型定义
+                            let formatted_type = filter_doc_comments(&utils::beautify_source_code(&type_def.source_code));
                             
                             // 处理可能的冗余pub关键字
                             let visibility_prefix = type_def.visibility.to_string();
                             
-                            // 将格式化后的代码分割成行
+                            // 将格式化后的代码分割成行并添加缩进
                             let lines: Vec<&str> = formatted_type.lines().collect();
-                            let mut processed_lines = Vec::new();
+                            let mut processed_type = Vec::new();
                             
-                            for line in lines {
+                            for (i, line) in lines.iter().enumerate() {
                                 let trimmed = line.trim();
                                 
                                 // 检查是否是结构体或枚举的开始
-                                if trimmed.contains("struct ") || trimmed.contains("enum ") {
+                                if i == 0 && (trimmed.contains("struct ") || trimmed.contains("enum ")) {
                                     // 如果这行包含pub并且我们要添加pub前缀
                                     if trimmed.starts_with("pub ") && !visibility_prefix.is_empty() {
                                         // 移除原有的pub
                                         let without_pub = trimmed.replacen("pub ", "", 1);
-                                        processed_lines.push(format!("        {}{}", visibility_prefix, without_pub));
+                                        processed_type.push(format!("        {}{}", visibility_prefix, without_pub));
                                     } else if !trimmed.starts_with("pub ") && !visibility_prefix.is_empty() {
                                         // 添加可见性前缀
-                                        processed_lines.push(format!("        {}{}", visibility_prefix, trimmed));
+                                        processed_type.push(format!("        {}{}", visibility_prefix, trimmed));
                                     } else {
                                         // 保持原样，只添加缩进
-                                        processed_lines.push(format!("        {}", trimmed));
+                                        processed_type.push(format!("        {}", trimmed));
                                     }
                                 } else {
-                                    // 其他行（包括注释和结构体结束的大括号）保持原样，只添加缩进
-                                    processed_lines.push(format!("        {}", line.trim_matches(' ')));
+                                    // 其他行保持原样，只添加缩进
+                                    processed_type.push(format!("        {}", line.trim_matches(' ')));
                                 }
                             }
                             
-                            // 将处理后的行合并成最终的字符串
-                            let final_output = processed_lines.join("\n");
-                            writeln!(writer, "{}", final_output)?;
+                            // 输出处理后的类型定义
+                            let type_text = processed_type.join("\n");
+                            writeln!(writer, "{}", type_text)?;
                             
-                            // Output constructors once with proper indentation
-                            for constructor in &type_def.constructors {
-                                // Only output constructors, not path-specific methods
-                                if !constructor.contains("Call chain") {
-                                    let formatted_constructor = utils::beautify_source_code(constructor)
+                            // 现在找到所有属于这个类型的方法（包含&self参数）
+                            let type_name = type_path.split("::").last().unwrap_or(type_path);
+                            let mut impl_methods = Vec::new();
+                            
+                            // 从所有方法中筛选出属于当前类型的方法
+                            for method in &all_methods {
+                                // 检查方法是否有self参数
+                                if method.has_self_param {
+                                    // 将方法添加到impl块中
+                                    impl_methods.push(method);
+                                    processed_method_paths.insert(method.full_path.clone());
+                                }
+                            }
+                            
+                            // 如果找到了方法或者有构造函数，创建impl块
+                            if !impl_methods.is_empty() || !type_def.constructors.is_empty() {
+                                writeln!(writer, "\n        impl {} {{", type_name)?;
+                                
+                                // 首先输出构造函数
+                                for constructor in &type_def.constructors {
+                                    if !constructor.contains("Call chain") {
+                                        let formatted_constructor = extract_method_from_impl(&utils::beautify_source_code(constructor))
+                                            .lines()
+                                            .map(|line| format!("            {}", line))
+                                            .collect::<Vec<_>>()
+                                            .join("\n");
+                                        
+                                        writeln!(writer, "{}", formatted_constructor)?;
+                                    }
+                                }
+                                
+                                // 然后输出实例方法
+                                for method in &impl_methods {
+                                    // 添加方法的注释：入口点、中间函数或不安全实现
+                                    let method_type = if unsafe_functions.iter().any(|n| n.full_path == method.full_path) {
+                                        "不安全实现"
+                                    } else if seen_entry_points.contains(&method.full_path) {
+                                        "公共入口点"
+                                    } else {
+                                        "中间函数"
+                                    };
+                                    
+                                    writeln!(writer, "\n            // {}: {}", method_type, method.full_path)?;
+                                    
+                                    // 提取方法代码并添加正确的缩进，同时过滤掉文档注释
+                                    let method_code = extract_method_from_impl(&utils::beautify_source_code(&method.source_code))
                                         .lines()
-                                        .map(|line| format!("        {}", line))
+                                        .map(|line| format!("            {}", line))
                                         .collect::<Vec<_>>()
                                         .join("\n");
                                     
-                                    writeln!(writer, "\n{}", formatted_constructor)?;
+                                    writeln!(writer, "{}", method_code)?;
                                 }
+                                
+                                writeln!(writer, "        }}\n")?;
+                            } else {
+                                writeln!(writer, "")?;
                             }
-                            
-                            writeln!(writer, "")?;
                         }
                     }
                 }
                 
-                // Output implementations of all functions in this group
-                writeln!(writer, "        // 函数实现:")?;
+                // 创建一个新的Vec来存储没有被处理的方法
+                let remaining_methods: Vec<_> = all_methods.iter()
+                    .filter(|method| {
+                        // 如果方法已经被处理过，则跳过
+                        !processed_method_paths.contains(&method.full_path) &&
+                        // 如果方法是实例方法，也跳过，因为它们应该放在impl块中
+                        !method.has_self_param
+                    })
+                    .collect();
                 
-                // 1. Output the public entry point functions first
-                let mut seen_entry_points = HashSet::new();
-                for path in &paths {
-                    if !path.is_empty() {
-                        let entry_node = &path[0];
-                        if seen_entry_points.insert(entry_node.full_path.clone()) {
-                            writeln!(writer, "        // 公共入口点: {}", entry_node.full_path)?;
-                            let source_code = utils::beautify_source_code(&entry_node.source_code)
-                                .lines()
-                                .map(|line| format!("        {}", line))
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            
-                            writeln!(writer, "{}", source_code)?;
-                            writeln!(writer, "")?;
-                        }
-                    }
-                }
-                
-                // 2. Output the unsafe destination function
-                for path in &paths {
-                    if !path.is_empty() {
-                        let unsafe_node = path.last().unwrap();
-                        writeln!(writer, "        // 不安全实现: {}", unsafe_node.full_path)?;
-                        let source_code = utils::beautify_source_code(&unsafe_node.source_code)
+                // 输出剩余的静态函数（没有放入impl块的函数）
+                if !remaining_methods.is_empty() {
+                    writeln!(writer, "        // 其他函数实现:")?;
+                    
+                    for method in &remaining_methods {
+                        // 添加方法的注释：入口点、中间函数或不安全实现
+                        let method_type = if unsafe_functions.iter().any(|n| n.full_path == method.full_path) {
+                            "不安全实现"
+                        } else if seen_entry_points.contains(&method.full_path) {
+                            "公共入口点"
+                        } else {
+                            "中间函数"
+                        };
+                        
+                        writeln!(writer, "        // {}: {}", method_type, method.full_path)?;
+                        
+                        // 输出方法代码，同时过滤掉文档注释
+                        let source_code = filter_doc_comments(&utils::beautify_source_code(&method.source_code))
                             .lines()
                             .map(|line| format!("        {}", line))
                             .collect::<Vec<_>>()
@@ -554,32 +637,54 @@ impl StaticAnalyzer {
                         
                         writeln!(writer, "{}", source_code)?;
                         writeln!(writer, "")?;
-                        break; // Only need to output it once
                     }
                 }
                 
-                // 3. Output any intermediate functions (that aren't entry points or the unsafe function)
-                // FIXED: Use a HashMap instead of HashSet to avoid the Hash trait requirement
-                let mut intermediate_functions = HashMap::new();
-                for path in &paths {
-                    if path.len() > 2 { // Only paths with intermediates
-                        for i in 1..path.len()-1 {
-                            let node = &path[i];
-                            intermediate_functions.insert(node.full_path.clone(), node);
-                        }
-                    }
-                }
+                // 添加所有带有&self参数的方法到Queue的impl块中
+                // 找到所有带有&self参数的方法
+                let self_methods: Vec<_> = all_methods.iter()
+                    .filter(|method| method.has_self_param)
+                    .collect();
                 
-                for (_, node) in intermediate_functions {
-                    writeln!(writer, "        // 中间函数: {}", node.full_path)?;
-                    let source_code = utils::beautify_source_code(&node.source_code)
-                        .lines()
-                        .map(|line| format!("        {}", line))
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                if !self_methods.is_empty() {
+                    // 找到Queue类型
+                    let queue_type = all_types.iter()
+                        .find(|type_path| type_path.ends_with("Queue"));
                     
-                    writeln!(writer, "{}", source_code)?;
-                    writeln!(writer, "")?;
+                    if let Some(queue_type) = queue_type {
+                        let type_name = queue_type.split("::").last().unwrap_or(queue_type);
+                        
+                        // 创建或扩展impl块
+                        writeln!(writer, "\n        impl {} {{", type_name)?;
+                        
+                        // 输出所有实例方法
+                        for method in &self_methods {
+                            // 添加方法的注释：入口点、中间函数或不安全实现
+                            let method_type = if unsafe_functions.iter().any(|n| n.full_path == method.full_path) {
+                                "不安全实现"
+                            } else if seen_entry_points.contains(&method.full_path) {
+                                "公共入口点"
+                            } else {
+                                "中间函数"
+                            };
+                            
+                            writeln!(writer, "\n            // {}: {}", method_type, method.full_path)?;
+                            
+                            // 提取方法代码并添加正确的缩进，同时过滤掉文档注释
+                            let method_code = extract_method_from_impl(&utils::beautify_source_code(&method.source_code))
+                                .lines()
+                                .map(|line| format!("            {}", line))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            
+                            writeln!(writer, "{}", method_code)?;
+                            
+                            // 标记方法已处理
+                            processed_method_paths.insert(method.full_path.clone());
+                        }
+                        
+                        writeln!(writer, "        }}\n")?;
+                    }
                 }
                 
                 // 关闭组模块
@@ -611,4 +716,66 @@ impl StaticAnalyzer {
             })
             .collect::<String>()
     }
+}
+
+/// 从impl块中提取方法定义，并移除文档注释
+fn extract_method_from_impl(source_code: &str) -> String {
+    // 检查是否包含impl
+    if !source_code.contains("impl") {
+        return filter_doc_comments(source_code);
+    }
+    
+    // 分割成行
+    let lines: Vec<&str> = source_code.lines().collect();
+    let mut result = Vec::new();
+    let mut in_method = false;
+    let mut brace_count = 0;
+    
+    for line in lines {
+        let trimmed = line.trim();
+        
+        // 跳过文档注释
+        if trimmed.starts_with("///") || trimmed.starts_with("/**") || trimmed.starts_with("*/") || trimmed.starts_with("*") {
+            continue;
+        }
+        
+        // 跳过impl行
+        if trimmed.starts_with("impl") && trimmed.contains("{") {
+            continue;
+        }
+        
+        // 检测方法定义的开始
+        if (trimmed.contains("fn ") || trimmed.contains("unsafe fn ")) && 
+           (trimmed.contains("pub fn") || trimmed.contains("fn ")) {
+            in_method = true;
+            brace_count = trimmed.matches('{').count() as i32 - trimmed.matches('}').count() as i32;
+            result.push(trimmed.to_string());
+            continue;
+        }
+        
+        // 如果在方法内，收集内容
+        if in_method {
+            result.push(trimmed.to_string());
+            brace_count += trimmed.matches('{').count() as i32 - trimmed.matches('}').count() as i32;
+            
+            // 检测方法结束
+            if brace_count <= 0 {
+                in_method = false;
+            }
+        }
+    }
+    
+    result.join("\n")
+}
+
+/// 过滤掉源代码中的文档注释
+fn filter_doc_comments(source_code: &str) -> String {
+    source_code.lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.starts_with("///") && !trimmed.starts_with("/**") && 
+            !trimmed.starts_with("*/") && !trimmed.starts_with("* ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
