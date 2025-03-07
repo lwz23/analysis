@@ -13,7 +13,7 @@ fn main() -> std::io::Result<()> {
     if args.len() < 2 {
         eprintln!("Usage: {} <Rust project or file path> [output file]", args[0]);
         eprintln!("  <Rust project or file path>: Path to a Rust file or directory");
-        eprintln!("  [output file]: Optional path to save results (default: unsafe_paths.rs)");
+        eprintln!("  [output file]: Optional path to save results (default: ./unsafe_paths.rs)");
         return Ok(());
     }
 
@@ -21,14 +21,36 @@ fn main() -> std::io::Result<()> {
     let output_path = if args.len() >= 3 {
         PathBuf::from(&args[2])
     } else {
-        let mut output = PathBuf::from(&args[1]);
-        if output.is_dir() {
-            output = output.join("unsafe_paths.rs");
+        // 获取当前工作目录
+        let current_dir = match std::env::current_dir() {
+            Ok(dir) => dir,
+            Err(e) => {
+                eprintln!("Error getting current directory: {}, falling back to input directory", e);
+                if input_path.is_dir() {
+                    input_path.clone()
+                } else {
+                    input_path.parent().unwrap_or(&PathBuf::from(".")).to_path_buf()
+                }
+            }
+        };
+        
+        // 从输入路径获取一个有意义的文件名
+        let file_name = if input_path.is_dir() {
+            // 如果输入是目录，使用目录名作为文件名的一部分
+            let dir_name = input_path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("project");
+            format!("{}_unsafe_paths.rs", dir_name)
         } else {
-            let stem = output.file_stem().unwrap_or_default();
-            output = output.with_file_name(format!("{}_analysis.rs", stem.to_string_lossy()));
-        }
-        output
+            // 如果输入是文件，使用文件名作为文件名的一部分
+            let stem = input_path.file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("file");
+            format!("{}_analysis.rs", stem)
+        };
+        
+        // 将文件放在当前目录下
+        current_dir.join(file_name)
     };
     
     // Use catch_unwind to capture all possible panics
