@@ -40,8 +40,11 @@ impl FunctionVisitor {
         known_unsafe_functions.insert("ptr::copy".to_string());
         known_unsafe_functions.insert("ptr::copy_nonoverlapping".to_string());
         known_unsafe_functions.insert("std::ptr::drop_in_place".to_string());
-        known_unsafe_functions.insert("from_raw_parts".to_string());
         known_unsafe_functions.insert("from_raw_parts_mut".to_string());
+        known_unsafe_functions.insert("slice::from_raw_parts_mut".to_string());
+        known_unsafe_functions.insert("slice::from_raw_parts".to_string());
+        known_unsafe_functions.insert("core::slice::from_raw_parts_mut".to_string());
+        known_unsafe_functions.insert("core::slice::from_raw_parts".to_string());
         known_unsafe_functions.insert("from_utf8_unchecked".to_string());
         known_unsafe_functions.insert("from_utf8_unchecked_mut".to_string());
         
@@ -447,9 +450,11 @@ impl FunctionVisitor {
 
     // 判断函数调用是否是常见的unsafe操作
     pub fn is_common_unsafe_operation(&self, func_path: &str) -> Option<UnsafeOperationType> {
-        // 常见的unsafe操作列表
+        // 常见的unsafe函数名列表
         let common_unsafe_funcs = [
             // 裸指针相关操作
+            ("from_raw_parts", UnsafeOperationType::RawPointerDereference),
+            ("from_raw_parts_mut", UnsafeOperationType::RawPointerDereference),
             ("copy_nonoverlapping", UnsafeOperationType::RawPointerDereference),
             ("copy", UnsafeOperationType::RawPointerDereference),
             ("write", UnsafeOperationType::RawPointerDereference),
@@ -470,18 +475,122 @@ impl FunctionVisitor {
             ("set_len", UnsafeOperationType::UnsafeMethodCall),
             ("as_ptr", UnsafeOperationType::UnsafeMethodCall),
             ("as_mut_ptr", UnsafeOperationType::UnsafeMethodCall),
-
-            ("from_utf8_unchecked", UnsafeOperationType::UnsafeFunctionCall),
-            ("from_utf8_unchecked_mut", UnsafeOperationType::UnsafeFunctionCall),
+            ("from_utf8_unchecked", UnsafeOperationType::UnsafeMethodCall),
+            ("from_utf8_unchecked_mut", UnsafeOperationType::UnsafeMethodCall),
         ];
         
+        // 1. 先检查完整的函数调用路径
         for (keyword, op_type) in common_unsafe_funcs.iter() {
             if func_path.contains(keyword) {
                 return Some(op_type.clone());
             }
         }
         
+        // 2. 如果没有匹配到完整路径，检查路径的最后一部分
+        if let Some(last_part) = func_path.split("::").last() {
+            for (keyword, op_type) in common_unsafe_funcs.iter() {
+                if last_part == *keyword {
+                    return Some(op_type.clone());
+                }
+            }
+        }
+        
         None
+    }
+
+    /// 检查完整或部分函数路径是否是已知的unsafe函数
+    pub fn is_known_unsafe_full_path(&self, segments: &[String]) -> bool {
+        if segments.is_empty() {
+            return false;
+        }
+        
+        // 单独函数名检测 - 无论在什么路径下，这些函数都被视为unsafe
+        let unsafe_function_names = [
+            "from_raw_parts",
+            "from_raw_parts_mut",
+            "copy_nonoverlapping",
+            "transmute",
+            "forget",
+            "offset",
+            "from_utf8_unchecked",
+            "from_utf8_unchecked_mut",
+            "drop_in_place",
+        ];
+        
+        // 检查最后的函数名是否是已知的unsafe函数
+        let last_segment = &segments[segments.len() - 1];
+        if unsafe_function_names.contains(&last_segment.as_str()) {
+            // 如果函数名是已知unsafe函数，再确认所在的上下文是否匹配
+            // 例如，如果函数名是"from_raw_parts"，我们需要检查它是否在slice模块中
+            
+            // from_raw_parts/from_raw_parts_mut: 检查是否来自slice模块
+            if (last_segment == "from_raw_parts" || last_segment == "from_raw_parts_mut") && segments.len() > 1 {
+                let prev_segment = &segments[segments.len() - 2];
+                // 如果前一个部分不是slice，可能是其他模块的同名函数，不一定是unsafe
+                if prev_segment != "slice" && prev_segment != "std" && prev_segment != "core" {
+                    // 但作为保守策略，我们仍然认为它是unsafe的
+                    return true;
+                }
+            }
+            
+            // copy/copy_nonoverlapping/read/write: 检查是否来自ptr模块
+            if (last_segment == "copy" || last_segment == "copy_nonoverlapping" || last_segment == "read" || last_segment == "write") && segments.len() > 1 {
+                let prev_segment = &segments[segments.len() - 2];
+                // 如果前一个部分不是ptr，可能是其他模块的同名函数，不一定是unsafe
+                if prev_segment != "ptr" && prev_segment != "std" && prev_segment != "core" {
+                    // 允许其他unsafe调用也能被检测到
+                    return true;
+                }
+            }
+            
+            // transmute/forget: 检查是否来自mem模块
+            if (last_segment == "transmute" || last_segment == "forget") && segments.len() > 1 {
+                let prev_segment = &segments[segments.len() - 2];
+                // 如果前一个部分不是mem，可能是其他模块的同名函数，不一定是unsafe
+                if prev_segment != "mem" && prev_segment != "std" && prev_segment != "core" {
+                    // 允许其他unsafe调用也能被检测到
+                    return true;
+                }
+            }
+            
+            // 保守策略：即使没有正确的上下文，仍然认为它可能是unsafe
+            return true;
+        }
+        
+        // 常见的unsafe函数完整路径
+        let known_unsafe_paths = [
+            vec!["core", "slice", "from_raw_parts"],
+            vec!["core", "slice", "from_raw_parts_mut"],
+            vec!["std", "slice", "from_raw_parts"],
+            vec!["std", "slice", "from_raw_parts_mut"],
+            vec!["slice", "from_raw_parts"],
+            vec!["slice", "from_raw_parts_mut"],
+            vec!["core", "ptr", "read"],
+            vec!["core", "ptr", "write"],
+            vec!["core", "ptr", "copy"],
+            vec!["core", "ptr", "copy_nonoverlapping"],
+            vec!["std", "ptr", "read"],
+            vec!["std", "ptr", "write"],
+            vec!["std", "ptr", "copy"],
+            vec!["std", "ptr", "copy_nonoverlapping"],
+            vec!["std", "mem", "transmute"],
+            vec!["core", "mem", "transmute"],
+            vec!["core", "mem", "forget"],
+            vec!["std", "mem", "forget"],
+        ];
+        
+        // 检查是否匹配任何已知的unsafe函数路径
+        for path in &known_unsafe_paths {
+            if path.len() <= segments.len() {
+                let start_idx = segments.len() - path.len();
+                let matching = segments[start_idx..].iter().zip(path.iter()).all(|(a, b)| a == b);
+                if matching {
+                    return true;
+                }
+            }
+        }
+        
+        false
     }
 }
 
@@ -668,15 +777,27 @@ impl<'ast> Visit<'ast> for FunctionVisitor {
     
     /// 检测函数调用，可能是unsafe函数调用
     fn visit_expr_call(&mut self, i: &'ast ExprCall) {
-        if let Some(current_function) = &self.current_function {
-            let mut code_snippet = i.to_token_stream().to_string();
+        if let Some(_current_function) = &self.current_function {
+            let code_snippet = i.to_token_stream().to_string();
             
             // 检查是否调用unsafe函数
             if let Expr::Path(path) = &*i.func {
                 let path_str = path.to_token_stream().to_string();
                 
+                // 检查是否是完整路径的unsafe函数 (例如 core::slice::from_raw_parts)
+                let segments: Vec<String> = path.path.segments.iter()
+                    .map(|seg| seg.ident.to_string())
+                    .collect();
+                
+                if self.is_known_unsafe_full_path(&segments) {
+                    self.record_unsafe_operation(
+                        UnsafeOperationType::UnsafeFunctionCall,
+                        format!("调用unsafe函数: {}", path_str),
+                        code_snippet.clone()
+                    );
+                }
                 // 检查是否是已知的unsafe函数
-                if self.is_known_unsafe_function(&path_str) {
+                else if self.is_known_unsafe_function(&path_str) {
                     self.record_unsafe_operation(
                         UnsafeOperationType::UnsafeFunctionCall,
                         format!("调用unsafe函数: {}", path_str),
