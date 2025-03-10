@@ -1,28 +1,41 @@
 use syn;
+use std::panic::catch_unwind;
 
 /// Attempt to beautify source code using prettyplease or fall back to basic formatting
 pub fn beautify_source_code(source_code: &str) -> String {
-    // Direct formatting approach with prettyplease
-    if let Ok(parsed) = syn::parse_str::<syn::File>(&format!("{}", source_code)) {
-        return prettyplease::unparse(&parsed);
+    // 尝试使用prettyplease进行格式化
+    let result = catch_unwind(|| {
+        // 直接格式化方法
+        if let Ok(parsed) = syn::parse_str::<syn::File>(&format!("{}", source_code)) {
+            return prettyplease::unparse(&parsed);
+        }
+        
+        // 尝试将函数包装在mod中
+        let wrapped_code = format!("mod dummy {{ {} }}", source_code);
+        if let Ok(parsed) = syn::parse_str::<syn::File>(&wrapped_code) {
+            let formatted = prettyplease::unparse(&parsed);
+            return extract_from_mod(&formatted);
+        }
+        
+        // 尝试包装为impl块
+        let wrapped_code = format!("impl Dummy {{ {} }}", source_code);
+        if let Ok(parsed) = syn::parse_str::<syn::File>(&wrapped_code) {
+            let formatted = prettyplease::unparse(&parsed);
+            return extract_from_impl(&formatted);
+        }
+        
+        // 如果所有尝试都失败，返回原始代码
+        source_code.to_string()
+    });
+
+    // 如果prettyplease格式化失败，使用基本格式化
+    match result {
+        Ok(formatted) => formatted,
+        Err(_) => {
+            // 使用基本格式化作为后备方案
+            enhanced_format_source_code(source_code)
+        }
     }
-    
-    // Try to wrap the function in a mod to handle complete function definitions
-    let wrapped_code = format!("mod dummy {{ {} }}", source_code);
-    if let Ok(parsed) = syn::parse_str::<syn::File>(&wrapped_code) {
-        let formatted = prettyplease::unparse(&parsed);
-        return extract_from_mod(&formatted);
-    }
-    
-    // Try wrapping as an impl block for method definitions
-    let wrapped_code = format!("impl Dummy {{ {} }}", source_code);
-    if let Ok(parsed) = syn::parse_str::<syn::File>(&wrapped_code) {
-        let formatted = prettyplease::unparse(&parsed);
-        return extract_from_impl(&formatted);
-    }
-    
-    // As a last resort, use an enhanced basic formatter
-    enhanced_format_source_code(source_code)
 }
 
 /// Extract content from a dummy mod
