@@ -422,14 +422,14 @@ impl StaticAnalyzer {
                 writeln!(writer, "\n    // 组 {}: 通向不安全函数的路径: {}", group_idx + 1, unsafe_fn_name)?;
                 writeln!(writer, "    pub mod {} {{", group_module_name)?;
                 
-                // 添加路径信息作为注释
+                // 第一步：输出路径列表
                 writeln!(writer, "        // 路径列表:")?;
-                for (path_idx, path) in paths.iter().enumerate() {
-                    writeln!(writer, "        // {}.{} {}", 
-                        group_idx + 1, 
-                        path_idx + 1, 
-                        Self::format_path_with_visibility(path))?;
+                
+                for (i, path) in paths.iter().enumerate() {
+                    writeln!(writer, "        // {}.{} {}", group_idx + 1, i + 1, Self::format_path_with_visibility(path))?;
                 }
+                
+                writeln!(writer, "")?;
                 
                 // 收集所有需要输出的函数
                 let mut all_methods = Vec::new();
@@ -582,6 +582,16 @@ impl StaticAnalyzer {
                                     
                                     writeln!(writer, "\n            // {}: {}", method_type, method.full_path)?;
                                     
+                                    // 输出函数的unsafe操作信息
+                                    if !method.unsafe_operations.is_empty() {
+                                        writeln!(writer, "            // 不安全操作：")?;
+                                        for (j, op) in method.unsafe_operations.iter().enumerate() {
+                                            writeln!(writer, "            //            {}. 代码: {}", 
+                                                j + 1, 
+                                                op.code_snippet)?;
+                                        }
+                                    }
+                                    
                                     // 输出方法代码
                                     let method_code = extract_method_from_impl(&utils::beautify_source_code(&method.source_code))
                                         .lines()
@@ -621,6 +631,16 @@ impl StaticAnalyzer {
                         
                         writeln!(writer, "        // {}: {}", method_type, method.full_path)?;
                         
+                        // 输出函数的unsafe操作信息
+                        if !method.unsafe_operations.is_empty() {
+                            writeln!(writer, "        // 不安全操作：")?;
+                            for (j, op) in method.unsafe_operations.iter().enumerate() {
+                                writeln!(writer, "        //            {}. 代码: {}", 
+                                    j + 1, 
+                                    op.code_snippet)?;
+                            }
+                        }
+                        
                         // 输出方法代码
                         let source_code = filter_doc_comments(&utils::beautify_source_code(&method.source_code))
                             .lines()
@@ -645,22 +665,23 @@ impl StaticAnalyzer {
         Ok(())
     }
     
-    /// Format path with visibility information
+    /// Format a call path with visibility information
     fn format_path_with_visibility(path: &[PathNodeInfo]) -> String {
-        path.iter()
-            .enumerate()
-            .map(|(i, node)| {
-                // Get last part of function name (without module path)
-                let simple_name = node.full_path.split("::").last().unwrap_or(&node.full_path);
-                let visibility_prefix = node.visibility.to_string();
-                
-                if i == 0 {
-                    format!("{}fn {}", visibility_prefix, simple_name)
-                } else {
-                    format!(" -> {}fn {}", visibility_prefix, simple_name)
-                }
-            })
-            .collect::<String>()
+        let mut result = String::new();
+        
+        // 将整个路径格式化为一行
+        for (i, node) in path.iter().enumerate() {
+            // 添加函数名和可见性
+            let func_name = node.full_path.split("::").last().unwrap_or(&node.full_path);
+            result.push_str(&format!("{}{}", node.visibility.to_string(), func_name));
+            
+            // 添加箭头，除非是最后一个节点
+            if i < path.len() - 1 {
+                result.push_str(" -> ");
+            }
+        }
+        
+        result
     }
 }
 

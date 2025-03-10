@@ -1,5 +1,40 @@
 use std::collections::{HashMap, HashSet};
 
+// Unsafe operation type
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnsafeOperationType {
+    RawPointerDereference,  // 裸指针解引用
+    UnsafeFunctionCall,     // 调用unsafe函数
+    UnsafeMethodCall,       // 调用unsafe方法
+    InlineAssembly,         // 内联汇编
+    UnionFieldAccess,       // 访问联合体字段
+    MutStaticAccess,        // 访问可变静态变量
+    Other(String),          // 其他类型的unsafe操作
+}
+
+impl UnsafeOperationType {
+    pub fn to_string(&self) -> String {
+        match self {
+            UnsafeOperationType::RawPointerDereference => "裸指针解引用".to_string(),
+            UnsafeOperationType::UnsafeFunctionCall => "调用unsafe函数".to_string(),
+            UnsafeOperationType::UnsafeMethodCall => "调用unsafe方法".to_string(),
+            UnsafeOperationType::InlineAssembly => "内联汇编".to_string(),
+            UnsafeOperationType::UnionFieldAccess => "访问联合体字段".to_string(),
+            UnsafeOperationType::MutStaticAccess => "访问可变静态变量".to_string(),
+            UnsafeOperationType::Other(desc) => format!("其他unsafe操作: {}", desc),
+        }
+    }
+}
+
+// Detailed information about an unsafe operation
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsafeOperation {
+    pub operation_type: UnsafeOperationType,  // 操作类型
+    pub description: String,                  // 描述文本
+    pub code_snippet: String,                 // 代码片段
+    pub line_number: Option<usize>,           // 行号（可选）
+}
+
 // Type definition
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeDefinition {
@@ -48,6 +83,7 @@ pub struct FunctionInfo {
     pub return_custom_types: HashSet<String>, // Custom types used in function return
     pub has_self_param: bool, // 是否包含&self参数
     pub owner_type: Option<String>, // 函数所属的类型
+    pub unsafe_operations: Vec<UnsafeOperation>, // Unsafe operations in this function
 }
 
 // Function visibility
@@ -93,6 +129,7 @@ pub struct PathNodeInfo {
     pub return_custom_types: HashSet<String>, // Custom types used in function return
     pub has_self_param: bool,    // 是否包含&self参数
     pub owner_type: Option<String>, // 函数所属的类型名称
+    pub unsafe_operations: Vec<UnsafeOperation>, // Unsafe operations in this function
 }
 
 // Analysis result for a single file

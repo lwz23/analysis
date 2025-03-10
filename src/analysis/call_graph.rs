@@ -142,6 +142,7 @@ impl CallGraph {
                         return_custom_types: return_types,
                         has_self_param: info.has_self_param,
                         owner_type: info.owner_type.clone(),
+                        unsafe_operations: info.unsafe_operations.clone(),
                     }
                 } else {
                     // Default value, normally shouldn't reach here
@@ -153,6 +154,7 @@ impl CallGraph {
                         return_custom_types: HashSet::new(),
                         has_self_param: false,
                         owner_type: None,
+                        unsafe_operations: Vec::new(),
                     }
                 }
             })

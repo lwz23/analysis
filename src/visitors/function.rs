@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use syn::{
     visit::{self, Visit}, 
-    ItemFn, Visibility, ExprUnsafe, ImplItemFn,
+    ItemFn, Visibility, ExprUnsafe, ImplItemFn, Expr, ExprCall, ExprMethodCall, ExprPath,
+    ExprUnary, UnOp, Pat, PathSegment,
     // Removed unused import: spanned::Spanned
 };
 use quote::ToTokens;
 
-use crate::models::{FunctionInfo, TypeDefinition, VisibilityKind};
+use crate::models::{FunctionInfo, TypeDefinition, VisibilityKind, UnsafeOperation, UnsafeOperationType};
 
 /// Visitor for collecting function information and detecting unsafe blocks
 pub struct FunctionVisitor {
@@ -20,10 +21,30 @@ pub struct FunctionVisitor {
     pub type_definitions: HashMap<String, TypeDefinition>, // Collected type definitions
     pub current_impl_type: Option<String>, // Current impl block's type name
     pub impl_blocks: HashMap<String, Vec<String>>, // Collection of complete impl blocks for each type
+    pub in_unsafe_block: bool, // 是否在unsafe块内
+    pub current_unsafe_operations: Vec<UnsafeOperation>, // 当前函数中的unsafe操作
+    pub known_unsafe_functions: HashSet<String>, // 已知的unsafe函数列表
 }
 
 impl FunctionVisitor {
     pub fn new(file_path: String, source_code: String) -> Self {
+        // 初始化已知的unsafe函数列表
+        let mut known_unsafe_functions = HashSet::new();
+        // 标准库中常见的unsafe函数
+        known_unsafe_functions.insert("std::mem::transmute".to_string());
+        known_unsafe_functions.insert("std::mem::transmute_copy".to_string());
+        known_unsafe_functions.insert("ptr::read".to_string());
+        known_unsafe_functions.insert("ptr::read_volatile".to_string());
+        known_unsafe_functions.insert("ptr::write".to_string());
+        known_unsafe_functions.insert("ptr::write_volatile".to_string());
+        known_unsafe_functions.insert("ptr::copy".to_string());
+        known_unsafe_functions.insert("ptr::copy_nonoverlapping".to_string());
+        known_unsafe_functions.insert("std::ptr::drop_in_place".to_string());
+        known_unsafe_functions.insert("from_raw_parts".to_string());
+        known_unsafe_functions.insert("from_raw_parts_mut".to_string());
+        known_unsafe_functions.insert("from_utf8_unchecked".to_string());
+        known_unsafe_functions.insert("from_utf8_unchecked_mut".to_string());
+        
         FunctionVisitor {
             current_module_path: Vec::new(),
             functions: HashMap::new(),
@@ -35,6 +56,9 @@ impl FunctionVisitor {
             type_definitions: HashMap::new(),
             current_impl_type: None,
             impl_blocks: HashMap::new(),
+            in_unsafe_block: false,
+            current_unsafe_operations: Vec::new(),
+            known_unsafe_functions,
         }
     }
     
@@ -112,6 +136,7 @@ impl FunctionVisitor {
             return_custom_types: return_types,
             has_self_param,
             owner_type,
+            unsafe_operations: Vec::new(),
         };
         
         self.functions.insert(full_path, info);
@@ -172,6 +197,7 @@ impl FunctionVisitor {
             return_custom_types: return_types,
             has_self_param,
             owner_type,
+            unsafe_operations: Vec::new(),
         };
         
         self.functions.insert(full_path, info);
@@ -224,18 +250,6 @@ impl FunctionVisitor {
             }
         }
         false
-    }
-    
-    /// Update current function's unsafe state
-    pub fn update_unsafe_state(&mut self) {
-        if let Some(ref func_path) = self.current_function {
-            if self.has_unsafe {
-                if let Some(info) = self.functions.get_mut(func_path) {
-                    info.has_internal_unsafe = true;
-                    self.unsafe_functions.insert(func_path.clone());
-                }
-            }
-        }
     }
     
     /// Analyze custom types used in function signature, return parameters and return types separately
@@ -317,6 +331,158 @@ impl FunctionVisitor {
             "SystemTime" | "Path" | "PathBuf"
         )
     }
+    
+    /// 检测是否是已知的unsafe函数
+    pub fn is_known_unsafe_function(&self, path: &str) -> bool {
+        self.known_unsafe_functions.contains(path)
+    }
+    
+    /// 检查函数名是否包含unsafe关键词
+    pub fn has_unsafe_keywords(&self, name: &str) -> bool {
+        name.contains("unsafe") || 
+        name.contains("unchecked") || 
+        name.contains("as_ptr") || 
+        name.contains("as_mut_ptr") || 
+        name == "assume_init" || 
+        name == "set_len" ||
+        name.contains("transmute") ||
+        name.contains("from_raw_parts")
+    }
+    
+    /// 记录unsafe操作
+    pub fn record_unsafe_operation(&mut self, op_type: UnsafeOperationType, description: String, code_snippet: String) {
+        // 只有在有当前函数的情况下才记录
+        if let Some(current_fn) = &self.current_function {
+            // 检查是否已存在相同的操作（相同代码片段）
+            for op in &self.current_unsafe_operations {
+                if op.code_snippet == code_snippet {
+                    return; // 跳过重复的操作
+                }
+            }
+            
+            // 简化描述，去除冗余信息
+            let simplified_description = match &op_type {
+                UnsafeOperationType::RawPointerDereference => "裸指针操作".to_string(),
+                UnsafeOperationType::UnsafeFunctionCall => "调用unsafe函数".to_string(),
+                UnsafeOperationType::UnsafeMethodCall => "调用unsafe方法".to_string(),
+                UnsafeOperationType::InlineAssembly => "内联汇编".to_string(),
+                UnsafeOperationType::UnionFieldAccess => "访问联合体字段".to_string(),
+                UnsafeOperationType::MutStaticAccess => "访问可变静态变量".to_string(),
+                UnsafeOperationType::Other(desc) => desc.clone(),
+            };
+            
+            let operation = UnsafeOperation {
+                operation_type: op_type,
+                description: simplified_description,
+                code_snippet,
+                line_number: None,
+            };
+            
+            // 先将操作添加到当前函数中
+            if let Some(fn_info) = self.functions.get_mut(current_fn) {
+                fn_info.unsafe_operations.push(operation.clone());
+            }
+            
+            // 再添加到当前收集的操作列表中
+            self.current_unsafe_operations.push(operation);
+        }
+    }
+    
+    /// 检测是否是裸指针类型
+    pub fn is_raw_pointer_type(&self, ty: &syn::Type) -> bool {
+        match ty {
+            syn::Type::Ptr(_) => true,
+            _ => false,
+        }
+    }
+    
+    /// 检测expr是否可能是裸指针
+    pub fn might_be_raw_pointer(&self, expr: &Expr) -> bool {
+        match expr {
+            // 检查指针类型转换，如：expr as *const T 或 expr as *mut T
+            Expr::Cast(expr_cast) => {
+                match &*expr_cast.ty {
+                    syn::Type::Ptr(_) => true,
+                    _ => false,
+                }
+            },
+            // 检查路径表达式，如：ptr
+            Expr::Path(expr_path) => {
+                let path_str = expr_path.to_token_stream().to_string();
+                path_str.contains("ptr") || 
+                path_str.contains("raw") || 
+                path_str.contains("pointer")
+            },
+            // 检查方法调用结果，如：ptr.add(1)
+            Expr::MethodCall(method_call) => {
+                let method_name = method_call.method.to_string();
+                method_name == "add" || 
+                method_name == "offset" || 
+                method_name == "as_ptr" || 
+                method_name == "as_mut_ptr"
+            },
+            _ => false,
+        }
+    }
+    
+    /// 更新unsafe状态
+    pub fn update_unsafe_state(&mut self) {
+        if let Some(name) = &self.current_function {
+            if let Some(func) = self.functions.get_mut(name) {
+                func.has_internal_unsafe = self.has_unsafe;
+                
+                // 如果有unsafe块或调用，将函数添加到unsafe函数集合中
+                if self.has_unsafe || func.is_unsafe_fn {
+                    self.unsafe_functions.insert(name.clone());
+                }
+                
+                // 更新函数的unsafe操作列表
+                func.unsafe_operations = self.current_unsafe_operations.clone();
+            }
+        }
+        
+        // 重置当前unsafe操作列表
+        self.current_unsafe_operations.clear();
+    }
+
+    // 判断函数调用是否是常见的unsafe操作
+    pub fn is_common_unsafe_operation(&self, func_path: &str) -> Option<UnsafeOperationType> {
+        // 常见的unsafe操作列表
+        let common_unsafe_funcs = [
+            // 裸指针相关操作
+            ("copy_nonoverlapping", UnsafeOperationType::RawPointerDereference),
+            ("copy", UnsafeOperationType::RawPointerDereference),
+            ("write", UnsafeOperationType::RawPointerDereference),
+            ("read", UnsafeOperationType::RawPointerDereference),
+            ("offset", UnsafeOperationType::RawPointerDereference),
+            ("add", UnsafeOperationType::RawPointerDereference),
+            ("drop_in_place", UnsafeOperationType::RawPointerDereference),
+            ("slice_from_raw_parts", UnsafeOperationType::RawPointerDereference),
+            ("slice_from_raw_parts_mut", UnsafeOperationType::RawPointerDereference),
+            
+            // 内存相关
+            ("transmute", UnsafeOperationType::Other("内存转换".to_string())),
+            ("forget", UnsafeOperationType::Other("内存忽略".to_string())),
+            ("zeroed", UnsafeOperationType::Other("零初始化".to_string())),
+            ("uninitialized", UnsafeOperationType::Other("未初始化内存".to_string())),
+            
+            // 其他常见unsafe操作
+            ("set_len", UnsafeOperationType::UnsafeMethodCall),
+            ("as_ptr", UnsafeOperationType::UnsafeMethodCall),
+            ("as_mut_ptr", UnsafeOperationType::UnsafeMethodCall),
+
+            ("from_utf8_unchecked", UnsafeOperationType::UnsafeFunctionCall),
+            ("from_utf8_unchecked_mut", UnsafeOperationType::UnsafeFunctionCall),
+        ];
+        
+        for (keyword, op_type) in common_unsafe_funcs.iter() {
+            if func_path.contains(keyword) {
+                return Some(op_type.clone());
+            }
+        }
+        
+        None
+    }
 }
 
 impl<'ast> Visit<'ast> for FunctionVisitor {
@@ -364,8 +530,15 @@ impl<'ast> Visit<'ast> for FunctionVisitor {
     fn visit_expr_unsafe(&mut self, i: &'ast ExprUnsafe) {
         self.has_unsafe = true;
         
+        // 标记进入unsafe块
+        let prev_in_unsafe = self.in_unsafe_block;
+        self.in_unsafe_block = true;
+        
         // Continue visiting inside unsafe block
         visit::visit_expr_unsafe(self, i);
+        
+        // 恢复之前的状态
+        self.in_unsafe_block = prev_in_unsafe;
     }
     
     /// Visit struct definition
@@ -466,5 +639,92 @@ impl<'ast> Visit<'ast> for FunctionVisitor {
         
         // Clear current impl type
         self.current_impl_type = None;
+    }
+    
+    /// 检测裸指针解引用
+    fn visit_expr_unary(&mut self, i: &'ast ExprUnary) {
+        // 检查是否是解引用操作 (*expr)
+        if matches!(i.op, UnOp::Deref(_)) {
+            // 只有在unsafe块内的解引用才可能是危险的
+            if self.in_unsafe_block {
+                // 检查被解引用的表达式是否可能是裸指针
+                if self.might_be_raw_pointer(&i.expr) {
+                    // 排除明显的安全模式：&*expr（引用重借用）
+                    let expr_str = i.to_token_stream().to_string();
+                    if !expr_str.starts_with("& *") {
+                        self.record_unsafe_operation(
+                            UnsafeOperationType::RawPointerDereference,
+                            "解引用裸指针".to_string(),
+                            expr_str
+                        );
+                    }
+                }
+            }
+        }
+        
+        // 继续访问子表达式
+        visit::visit_expr_unary(self, i);
+    }
+    
+    /// 检测函数调用，可能是unsafe函数调用
+    fn visit_expr_call(&mut self, i: &'ast ExprCall) {
+        if let Some(current_function) = &self.current_function {
+            let mut code_snippet = i.to_token_stream().to_string();
+            
+            // 检查是否调用unsafe函数
+            if let Expr::Path(path) = &*i.func {
+                let path_str = path.to_token_stream().to_string();
+                
+                // 检查是否是已知的unsafe函数
+                if self.is_known_unsafe_function(&path_str) {
+                    self.record_unsafe_operation(
+                        UnsafeOperationType::UnsafeFunctionCall,
+                        format!("调用unsafe函数: {}", path_str),
+                        code_snippet.clone()
+                    );
+                }
+                
+                // 检查是否是常见的unsafe操作
+                if let Some(op_type) = self.is_common_unsafe_operation(&path_str) {
+                    self.record_unsafe_operation(
+                        op_type,
+                        format!("调用unsafe操作: {}", path_str),
+                        code_snippet
+                    );
+                }
+            }
+        }
+        
+        // 继续访问子表达式
+        visit::visit_expr_call(self, i);
+    }
+    
+    /// 检测方法调用，可能是unsafe方法调用
+    fn visit_expr_method_call(&mut self, i: &'ast ExprMethodCall) {
+        if let Some(current_function) = &self.current_function {
+            let method_name = i.method.to_string();
+            let code_snippet = i.to_token_stream().to_string();
+            
+            // 检查是否是已知的unsafe方法
+            if self.has_unsafe_keywords(&method_name) {
+                self.record_unsafe_operation(
+                    UnsafeOperationType::UnsafeMethodCall,
+                    format!("调用unsafe方法: {}", method_name),
+                    code_snippet.clone()
+                );
+            }
+            
+            // 检查是否是常见的unsafe操作
+            if let Some(op_type) = self.is_common_unsafe_operation(&method_name) {
+                self.record_unsafe_operation(
+                    op_type,
+                    format!("调用unsafe操作: {}", method_name),
+                    code_snippet
+                );
+            }
+        }
+        
+        // 继续访问子表达式
+        visit::visit_expr_method_call(self, i);
     }
 }
