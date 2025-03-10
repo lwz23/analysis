@@ -82,26 +82,19 @@ impl CallGraph {
     /// Check if path is valid, using public_non_unsafe_functions instead of public_functions
     /// for checking the first node
     pub fn is_valid_path(&self, path: &[String]) -> bool {
-        // Check path length must be greater than 1
-        if path.len() <= 1 {
+        // 修改：检查路径长度必须等于1（而不是大于1）
+        if path.len() != 1 {
             return false;
         }
         
-        // Check first node must be public and non-unsafe-declared function
+        // 检查节点必须是公共非unsafe声明函数
         if !self.public_non_unsafe_functions.contains(&path[0]) {
             return false;
         }
         
-        // Check last node must be internal unsafe function
-        if !self.unsafe_functions.contains(&path[path.len() - 1]) {
+        // 检查节点必须是内部unsafe函数
+        if !self.unsafe_functions.contains(&path[0]) {
             return false;
-        }
-        
-        // Check intermediate nodes can't be unsafe functions or public unsafe functions
-        for i in 1..path.len() - 1 {
-            if self.unsafe_functions.contains(&path[i]) || self.public_unsafe_functions.contains(&path[i]) {
-                return false;
-            }
         }
         
         true
@@ -166,40 +159,25 @@ impl CallGraph {
     pub fn find_paths_to_unsafe(&self) -> Vec<Vec<PathNodeInfo>> {
         let mut all_paths = Vec::new();
         
-        // First add all directly public unsafe functions
+        // 只添加直接的公共不安全函数
         for pub_unsafe_fn in &self.public_unsafe_functions {
-            // Only add those that are non-unsafe-declared public functions
+            // 只添加那些非unsafe声明的公共函数
             if self.public_non_unsafe_functions.contains(pub_unsafe_fn) {
                 let mut path = Vec::new();
                 path.push(pub_unsafe_fn.clone());
-                all_paths.push(path);
-            }
-        }
-        
-        // Get non-public unsafe functions
-        let non_public_unsafe = self.unsafe_functions.difference(&self.public_unsafe_functions)
-                                                   .cloned()
-                                                   .collect::<HashSet<String>>();
-        
-        // Pre-compute reachable unsafe functions for each non-unsafe-declared public function
-        for pub_fn in &self.public_non_unsafe_functions {
-            // Exclude functions that are already public unsafe
-            if !self.public_unsafe_functions.contains(pub_fn) {
-                // Pre-compute reachable targets
-                let reachable_targets = self.precompute_reachable_targets(pub_fn, &non_public_unsafe);
                 
-                if !reachable_targets.is_empty() {
-                    let paths = self.find_valid_paths(pub_fn, &reachable_targets);
-                    all_paths.extend(paths);
+                // 修改：使用is_valid_path验证，这里会检查路径长度是否为1
+                if self.is_valid_path(&path) {
+                    all_paths.push(path);
                 }
             }
         }
         
-        // Filter valid paths, minimal paths, and convert to detailed format
+        // 使用过滤器并转换为详细格式
+        // 修改：不再需要额外的路径长度过滤，因为is_valid_path已经要求路径长度为1
         all_paths.into_iter()
             .filter(|path| self.is_valid_path(path))
-            .filter(|path| self.is_minimal_path(path)) // Add minimal path filter
-            .filter(|path| path.len() > 1) // Only keep paths longer than 1
+            .filter(|path| self.is_minimal_path(path))
             .map(|path| self.convert_path_to_node_info(path))
             .collect()
     }
