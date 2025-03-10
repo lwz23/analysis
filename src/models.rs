@@ -9,6 +9,7 @@ pub enum UnsafeOperationType {
     InlineAssembly,         // 内联汇编
     UnionFieldAccess,       // 访问联合体字段
     MutStaticAccess,        // 访问可变静态变量
+    DirectParamToUnsafe,    // 参数直接传递给unsafe操作
     Other(String),          // 其他类型的unsafe操作
 }
 
@@ -21,6 +22,7 @@ impl UnsafeOperationType {
             UnsafeOperationType::InlineAssembly => "内联汇编".to_string(),
             UnsafeOperationType::UnionFieldAccess => "访问联合体字段".to_string(),
             UnsafeOperationType::MutStaticAccess => "访问可变静态变量".to_string(),
+            UnsafeOperationType::DirectParamToUnsafe => "参数直接传递给unsafe操作".to_string(),
             UnsafeOperationType::Other(desc) => format!("其他unsafe操作: {}", desc),
         }
     }
@@ -84,6 +86,7 @@ pub struct FunctionInfo {
     pub has_self_param: bool, // 是否包含&self参数
     pub owner_type: Option<String>, // 函数所属的类型
     pub unsafe_operations: Vec<UnsafeOperation>, // Unsafe operations in this function
+    pub param_names: HashSet<String>, // 函数参数名称集合
 }
 
 // Function visibility
@@ -138,4 +141,5 @@ pub struct FileAnalysisResult {
     pub file_path: String,
     pub paths: Vec<Vec<PathNodeInfo>>, // Modified to store detailed function info
     pub type_definitions: HashMap<String, TypeDefinition>, // Related custom type definitions
+    pub direct_param_paths: Vec<Vec<PathNodeInfo>>, // 模式1: 直接参数传递到unsafe操作的路径
 }

@@ -10,7 +10,7 @@ use walkdir::WalkDir;
 use rayon::prelude::*;
 
 use crate::visitors::{FunctionVisitor, CallVisitor};
-use crate::models::{FileAnalysisResult, PathNodeInfo};
+use crate::models::{FileAnalysisResult, PathNodeInfo, UnsafeOperationType};
 use crate::analysis::CallGraph;
 use crate::utils;
 
@@ -129,8 +129,8 @@ impl StaticAnalyzer {
             call_graph.add_call(call.caller, call.callee);
         }
         
-        // Find paths, now returns paths with detailed function info
-        let paths = call_graph.find_paths_to_unsafe();
+        // Find paths, now returns paths with detailed function info and direct param paths
+        let (paths, direct_param_paths) = call_graph.find_paths_to_unsafe();
         
         if paths.is_empty() {
             return Ok(None);
@@ -162,89 +162,20 @@ impl StaticAnalyzer {
                         if type_def_entry.constructors.is_empty() {
                             type_def_entry.constructors = def.constructors.clone();
                         }
-                        
-                        // Then add functions from THIS SPECIFIC call chain
-                        // Find the index of this path in the paths collection (using safe comparison)
-                        let path_index = {
-                            let mut idx = 0;
-                            let mut found = false;
-                            
-                            // Look for a matching path by comparing full_path values
-                            for (i, other_path) in paths.iter().enumerate() {
-                                if other_path.len() == path.len() {
-                                    let mut all_match = true;
-                                    for (j, node) in path.iter().enumerate() {
-                                        if other_path[j].full_path != node.full_path {
-                                            all_match = false;
-                                            break;
-                                        }
-                                    }
-                                    if all_match {
-                                        idx = i;
-                                        found = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            
-                            if found { idx + 1 } else { 1 }
-                        };
-                        
-                        for (step_index, node) in path.iter().enumerate() {
-                            // Only include functions that are actually in this path and operate on the type
-                            let operates_on_type = node.param_custom_types.contains(type_name) || 
-                                                  node.return_custom_types.contains(type_name);
-                            
-                            if operates_on_type {
-                                // Extract function name
-                                let fn_name = node.full_path.split("::").last().unwrap_or(&node.full_path);
-                                
-                                // Check how function uses this type
-                                let relation_type = if node.param_custom_types.contains(type_name) && 
-                                                      node.return_custom_types.contains(type_name) {
-                                    "parameters and return value"
-                                } else if node.param_custom_types.contains(type_name) {
-                                    "parameters"
-                                } else {
-                                    "return value"
-                                };
-                                
-                                // Format as impl block style, and add step comments
-                                let method_code = format!(
-                                    "impl {} {{\n    // Call chain #{} - Step #{} - Function: {} - Uses type as: {}\n    {}\n}}", 
-                                    def_name,
-                                    path_index,
-                                    step_index + 1,
-                                    fn_name,
-                                    relation_type,
-                                    utils::enhanced_format_source_code(&node.source_code)
-                                );
-                                
-                                // Check if this function implementation is already in the list
-                                let mut already_exists = false;
-                                for existing_code in &type_def_entry.constructors {
-                                    if existing_code.contains(&node.source_code) {
-                                        already_exists = true;
-                                        break;
-                                    }
-                                }
-                                
-                                // Add to results if not a duplicate
-                                if !already_exists {
-                                    type_def_entry.constructors.push(method_code);
-                                }
-                            }
-                        }
                     }
                 }
             }
         }
         
-        Ok(Some(FileAnalysisResult {
+        // Create result
+        let result = FileAnalysisResult {
             file_path: file_path_str,
             paths,
             type_definitions: path_type_defs,
-        }))
+            direct_param_paths,
+        };
+        
+        Ok(Some(result))
     }
 
     /// Parallel analyze directory
@@ -400,22 +331,23 @@ impl StaticAnalyzer {
             
             // Collect all paths leading to the same unsafe function
             for path in &result.paths {
-                if path.is_empty() {
-                    continue;
+                if !path.is_empty() {
+                    // 对于长度为1的路径，函数本身就是不安全函数
+                    let unsafe_fn = if path.len() == 1 {
+                        path[0].full_path.clone()
+                    } else {
+                        // 对于长度大于1的路径，最后一个函数是不安全函数
+                        path.last().unwrap().full_path.clone()
+                    };
+                    
+                    paths_by_destination.entry(unsafe_fn)
+                        .or_insert_with(Vec::new)
+                        .push(path.clone());
                 }
-                
-                // The last function in the path is the unsafe function
-                let unsafe_fn = &path.last().unwrap().full_path;
-                paths_by_destination.entry(unsafe_fn.clone())
-                    .or_default()
-                    .push(path.clone());
             }
             
-            writeln!(writer, "    // 发现 {} 组通向不安全函数的路径", paths_by_destination.len())?;
-            
-            // Process each group of paths leading to the same unsafe function
-            for (group_idx, (unsafe_fn, paths)) in paths_by_destination.into_iter().enumerate() {
-                // 为每个组创建一个子模块
+            // 输出每个不安全函数的路径
+            for (group_idx, (unsafe_fn, paths)) in paths_by_destination.iter().enumerate() {
                 let unsafe_fn_name = unsafe_fn.split("::").last().unwrap_or(&unsafe_fn);
                 let group_module_name = format!("group_{}", group_idx + 1);
                 
@@ -437,7 +369,7 @@ impl StaticAnalyzer {
                 
                 // 收集入口点函数
                 let mut seen_entry_points = HashSet::new();
-                for path in &paths {
+                for path in paths {
                     if !path.is_empty() {
                         let entry_node = &path[0];
                         if seen_entry_points.insert(entry_node.full_path.clone()) {
@@ -448,7 +380,7 @@ impl StaticAnalyzer {
                 
                 // 收集不安全函数（在修改后的系统中，对于长度为1的路径，不安全函数和入口点是同一个函数）
                 let mut unsafe_functions = Vec::new();
-                for path in &paths {
+                for path in paths {
                     if !path.is_empty() {
                         let unsafe_node = path.last().unwrap();
                         // 只添加尚未加入all_methods的函数
@@ -462,7 +394,7 @@ impl StaticAnalyzer {
                 
                 // 收集中间函数
                 let mut intermediate_functions = HashMap::new();
-                for path in &paths {
+                for path in paths {
                     if path.len() > 2 { // Only paths with intermediates
                         for i in 1..path.len()-1 {
                             let node = &path[i];
@@ -481,7 +413,7 @@ impl StaticAnalyzer {
                 // 收集所有相关的类型定义
                 let mut all_types = HashSet::new();
                 
-                for path in &paths {
+                for path in paths {
                     if path.is_empty() {
                         continue;
                     }
@@ -647,14 +579,15 @@ impl StaticAnalyzer {
                         }
                         
                         // 输出方法代码
-                        let source_code = filter_doc_comments(&utils::beautify_source_code(&method.source_code))
-                            .lines()
-                            .map(|line| format!("        {}", line))
-                            .collect::<Vec<_>>()
-                            .join("\n");
+                        let formatted_code = utils::beautify_source_code(&method.source_code);
+                        let lines = formatted_code.lines().collect::<Vec<_>>();
                         
-                        writeln!(writer, "{}", source_code)?;
-                        writeln!(writer, "")?;
+                        // 输出每行，保持原始格式
+                        for line in lines {
+                            // 增加基础缩进并保留原始结构
+                            let indented = format!("        {}", line);
+                            writeln!(writer, "{}", indented)?;
+                        }
                     }
                 }
                 
@@ -666,7 +599,169 @@ impl StaticAnalyzer {
             writeln!(writer, "}} // end of module {}\n", module_name)?;
         }
         
-        println!("成功写入 {} 个文件的分析结果", results.len());
+        writeln!(writer, "// 分析结果结束")?;
+        
+        // 创建模式1的输出文件
+        self.write_pattern1_results_to_file(output_path)?;
+        
+        Ok(())
+    }
+    
+    /// 将模式1（参数直接传递到unsafe操作）的结果写入单独的文件
+    pub fn write_pattern1_results_to_file(&self, output_path: &Path) -> io::Result<()> {
+        // 创建模式1输出文件路径
+        let file_stem = output_path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+        let file_ext = output_path.extension().unwrap_or_default().to_string_lossy().to_string();
+        let pattern1_path = output_path.with_file_name(format!("{}_pattern1.{}", file_stem, file_ext));
+        
+        println!("Writing pattern1 results to: {}", pattern1_path.display());
+        
+        let file = File::create(pattern1_path)?;
+        let mut writer = BufWriter::new(file);
+        
+        // 添加文件头部注释和模块声明
+        writeln!(writer, "// 自动生成的Rust代码文件 - 模式1：参数直接传递到unsafe操作的分析结果")?;
+        writeln!(writer, "// 此文件可以被编译器解析，具有语法高亮")?;
+        writeln!(writer, "\n// 注意：此文件仅用于查看，不应直接编译或运行")?;
+        writeln!(writer, "// 生成时间: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))?;
+        writeln!(writer, "\n#![allow(dead_code)]")?;
+        writeln!(writer, "#![allow(unused_variables)]")?;
+        writeln!(writer, "#![allow(unused_imports)]")?;
+        writeln!(writer, "#![allow(non_snake_case)]")?;
+        writeln!(writer, "\n// 模式1分析结果开始\n")?;
+        
+        let results = self.get_results();
+        
+        // 用于跟踪已处理的文件，避免重复输出
+        let mut processed_files = HashSet::new();
+        
+        for result in &results {
+            if result.direct_param_paths.is_empty() || processed_files.contains(&result.file_path) {
+                continue;
+            }
+            
+            // 标记文件已处理
+            processed_files.insert(result.file_path.clone());
+            
+            // 文件标题作为模块注释
+            writeln!(writer, "// ============================================================")?;
+            writeln!(writer, "// 文件: {}", result.file_path)?;
+            writeln!(writer, "// ============================================================\n")?;
+            
+            // 为每个文件创建一个模块
+            let module_name = Path::new(&result.file_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown_module")
+                .replace("-", "_")
+                .replace(".", "_");
+            
+            writeln!(writer, "pub mod {} {{", module_name)?;
+            
+            // Group paths by their destination function (the unsafe function)
+            let mut paths_by_destination: HashMap<String, Vec<Vec<PathNodeInfo>>> = HashMap::new();
+            
+            // Collect all paths leading to the same unsafe function
+            for path in &result.direct_param_paths {
+                if !path.is_empty() {
+                    // 对于长度为1的路径，函数本身就是不安全函数
+                    let unsafe_fn = if path.len() == 1 {
+                        path[0].full_path.clone()
+                    } else {
+                        // 对于长度大于1的路径，最后一个函数是不安全函数
+                        path.last().unwrap().full_path.clone()
+                    };
+                    
+                    paths_by_destination.entry(unsafe_fn)
+                        .or_insert_with(Vec::new)
+                        .push(path.clone());
+                }
+            }
+            
+            // 输出每个不安全函数的路径
+            for (group_idx, (unsafe_fn, paths)) in paths_by_destination.iter().enumerate() {
+                let unsafe_fn_name = unsafe_fn.split("::").last().unwrap_or(&unsafe_fn);
+                let group_module_name = format!("group_{}", group_idx + 1);
+                
+                writeln!(writer, "\n    // 组 {}: 通向不安全函数的路径: {}", group_idx + 1, unsafe_fn_name)?;
+                writeln!(writer, "    pub mod {} {{", group_module_name)?;
+                
+                // 第一步：输出路径列表
+                writeln!(writer, "        // 路径列表:")?;
+                
+                for (i, path) in paths.iter().enumerate() {
+                    writeln!(writer, "        // {}.{} {}", group_idx + 1, i + 1, Self::format_path_with_visibility(path))?;
+                }
+                
+                writeln!(writer, "")?;
+                
+                // 收集所有需要输出的函数
+                let mut all_methods = Vec::new();
+                let mut processed_method_paths = HashSet::new();
+                
+                // 收集入口点函数
+                let mut seen_entry_points = HashSet::new();
+                for path in paths {
+                    if !path.is_empty() {
+                        let entry_node = &path[0];
+                        if seen_entry_points.insert(entry_node.full_path.clone()) {
+                            all_methods.push(entry_node);
+                        }
+                    }
+                }
+                
+                // 输出所有收集到的函数
+                for method in all_methods {
+                    if processed_method_paths.contains(&method.full_path) {
+                        continue;
+                    }
+                    processed_method_paths.insert(method.full_path.clone());
+                    
+                    // 获取函数名
+                    let method_name = method.full_path.split("::").last().unwrap_or(&method.full_path);
+                    
+                    // 输出函数定义
+                    writeln!(writer, "        // 函数: {}", method.full_path)?;
+                    writeln!(writer, "        // 可见性: {}", method.visibility.to_string())?;
+                    
+                    // 输出unsafe操作信息
+                    if !method.unsafe_operations.is_empty() {
+                        writeln!(writer, "        // 包含的unsafe操作:")?;
+                        for op in &method.unsafe_operations {
+                            if matches!(op.operation_type, UnsafeOperationType::DirectParamToUnsafe) {
+                                writeln!(writer, "        //   - {}: {}", op.description, op.code_snippet)?;
+                            }
+                        }
+                    }
+                    
+                    // 输出函数代码 - 使用更接近原始格式的方式
+                    writeln!(writer, "        // ----------------------------")?;
+                    writeln!(writer, "        // 原始函数源代码")?;
+                    writeln!(writer, "        // ----------------------------")?;
+                    writeln!(writer, "        pub fn {}() {{", method_name)?;
+                    
+                    // 格式化源代码 - 保持原始缩进和注释
+                    let formatted_code = utils::beautify_source_code(&method.source_code);
+                    let lines = formatted_code.lines().collect::<Vec<_>>();
+                    
+                    // 输出每行，保持原始格式
+                    for line in lines {
+                        // 增加基础缩进并保留原始结构
+                        let indented = format!("            // {}", line);
+                        writeln!(writer, "{}", indented)?;
+                    }
+                    
+                    writeln!(writer, "        }}\n")?;
+                }
+                
+                writeln!(writer, "    }}\n")?;
+            }
+            
+            writeln!(writer, "}}\n")?;
+        }
+        
+        writeln!(writer, "// 模式1分析结果结束")?;
+        
         Ok(())
     }
     

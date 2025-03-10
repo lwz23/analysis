@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use crate::models::{FunctionInfo, PathNodeInfo, VisibilityKind};
+use crate::models::{FunctionInfo, PathNodeInfo, VisibilityKind, UnsafeOperationType};
 
 /// Function call graph representation
 pub struct CallGraph {
@@ -156,7 +156,7 @@ impl CallGraph {
 
     /// Find all valid paths from public functions to internal unsafe functions,
     /// return paths with detailed function information
-    pub fn find_paths_to_unsafe(&self) -> Vec<Vec<PathNodeInfo>> {
+    pub fn find_paths_to_unsafe(&self) -> (Vec<Vec<PathNodeInfo>>, Vec<Vec<PathNodeInfo>>) {
         let mut all_paths = Vec::new();
         
         // 只添加直接的公共不安全函数
@@ -174,9 +174,30 @@ impl CallGraph {
         }
         
         // 将路径转换为详细格式
-        all_paths.into_iter()
+        let paths = all_paths.into_iter()
             .map(|path| self.convert_path_to_node_info(path))
-            .collect()
+            .collect::<Vec<_>>();
+        
+        // 模式1分类：参数直接传递到unsafe操作的路径
+        let mut direct_param_paths = Vec::new();
+        
+        for path in &paths {
+            if !path.is_empty() {
+                // 检查路径中的每个函数是否包含DirectParamToUnsafe类型的操作
+                for node in path {
+                    let has_direct_param = node.unsafe_operations.iter().any(|op| {
+                        matches!(op.operation_type, UnsafeOperationType::DirectParamToUnsafe)
+                    });
+                    
+                    if has_direct_param {
+                        direct_param_paths.push(path.clone());
+                        break; // 找到一个就足够了
+                    }
+                }
+            }
+        }
+        
+        (paths, direct_param_paths)
     }
 
     /// Pre-compute reachable target functions, reducing search space
