@@ -412,18 +412,52 @@ impl FunctionVisitor {
             // 检查路径表达式，如：ptr
             Expr::Path(expr_path) => {
                 let path_str = expr_path.to_token_stream().to_string();
+                // 检查路径中是否包含指针相关关键字
                 path_str.contains("ptr") || 
                 path_str.contains("raw") || 
-                path_str.contains("pointer")
+                path_str.contains("pointer") ||
+                // 增加对明确指针类型变量的检测
+                path_str.ends_with("_ptr") ||
+                path_str.ends_with("_pointer") ||
+                path_str.contains("unsafe")
             },
             // 检查方法调用结果，如：ptr.add(1)
             Expr::MethodCall(method_call) => {
                 let method_name = method_call.method.to_string();
+                // 增加更多指针相关的方法名
                 method_name == "add" || 
                 method_name == "offset" || 
                 method_name == "as_ptr" || 
-                method_name == "as_mut_ptr"
+                method_name == "as_mut_ptr" ||
+                method_name == "from_raw_parts" ||
+                method_name == "from_raw_parts_mut" ||
+                method_name == "offset_from" ||
+                method_name == "read" ||
+                method_name == "write" ||
+                method_name == "copy" ||
+                method_name == "copy_nonoverlapping"
             },
+            // 增加对字段访问表达式的检测
+            Expr::Field(field_expr) => {
+                let field_name = field_expr.member.to_token_stream().to_string();
+                field_name.contains("ptr") || 
+                field_name.contains("pointer") ||
+                field_name.ends_with("_ptr") ||
+                field_name.ends_with("_pointer") ||
+                // 递归检查base表达式
+                self.might_be_raw_pointer(&field_expr.base)
+            },
+            // 增加对引用表达式的检测
+            Expr::Reference(ref_expr) => {
+                // 检查引用的表达式是否可能是裸指针
+                self.might_be_raw_pointer(&ref_expr.expr)
+            },
+            // 检查数组或元组索引
+            Expr::Index(index_expr) => {
+                // 检查被索引的表达式是否可能是裸指针
+                self.might_be_raw_pointer(&index_expr.expr)
+            },
+            // 默认情况
             _ => false,
         }
     }

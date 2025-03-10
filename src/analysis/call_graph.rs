@@ -173,11 +173,8 @@ impl CallGraph {
             }
         }
         
-        // 使用过滤器并转换为详细格式
-        // 修改：不再需要额外的路径长度过滤，因为is_valid_path已经要求路径长度为1
+        // 将路径转换为详细格式
         all_paths.into_iter()
-            .filter(|path| self.is_valid_path(path))
-            .filter(|path| self.is_minimal_path(path))
             .map(|path| self.convert_path_to_node_info(path))
             .collect()
     }

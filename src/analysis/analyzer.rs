@@ -446,13 +446,14 @@ impl StaticAnalyzer {
                     }
                 }
                 
-                // 收集不安全函数
+                // 收集不安全函数（在修改后的系统中，对于长度为1的路径，不安全函数和入口点是同一个函数）
                 let mut unsafe_functions = Vec::new();
                 for path in &paths {
                     if !path.is_empty() {
                         let unsafe_node = path.last().unwrap();
-                        // 只添加一次
-                        if !unsafe_functions.iter().any(|n: &&PathNodeInfo| n.full_path == unsafe_node.full_path) {
+                        // 只添加尚未加入all_methods的函数
+                        let already_added = all_methods.iter().any(|n| n.full_path == unsafe_node.full_path);
+                        if !already_added && !unsafe_functions.iter().any(|n: &&PathNodeInfo| n.full_path == unsafe_node.full_path) {
                             unsafe_functions.push(unsafe_node);
                         }
                     }
@@ -469,8 +470,12 @@ impl StaticAnalyzer {
                         }
                     }
                 }
-                for (_, node) in &intermediate_functions {
-                    all_methods.push(node);
+                // 仅添加尚未在all_methods中的中间函数
+                for (path, node) in &intermediate_functions {
+                    let already_added = all_methods.iter().any(|n| n.full_path == *path);
+                    if !already_added {
+                        all_methods.push(node);
+                    }
                 }
                 
                 // 收集所有相关的类型定义
